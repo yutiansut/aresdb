@@ -22,9 +22,9 @@ import (
 	"github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/stretchr/testify/mock"
-	"github.com/uber/aresdb/diskstore/mocks"
 	"github.com/uber/aresdb/common"
-	memCom"github.com/uber/aresdb/memstore/common"
+	"github.com/uber/aresdb/diskstore/mocks"
+	memCom "github.com/uber/aresdb/memstore/common"
 	metaCom "github.com/uber/aresdb/metastore/common"
 	"github.com/uber/aresdb/testing"
 	"github.com/uber/aresdb/utils"
@@ -44,6 +44,7 @@ var _ = ginkgo.Describe("redo_log_manager", func() {
 		MaxRedoLogFileSize:      1 << 30,
 	}
 
+	namespace := ""
 	redoLogCfg := &common.RedoLogConfig{
 		DiskConfig: common.DiskRedoLogConfig{
 			Disabled: false,
@@ -55,8 +56,8 @@ var _ = ginkgo.Describe("redo_log_manager", func() {
 			return time.Unix(int64(5), 0)
 		})
 
-		f, _ := NewRedoLogManagerMaster(redoLogCfg, CreateMockDiskStore(), nil)
-		m, _ := f.NewRedologManager(table, shard, tableConfig)
+		f, _ := NewRedoLogManagerMaster(namespace, redoLogCfg, CreateMockDiskStore(), nil)
+		m, _ := f.NewRedologManager(table, shard, false, tableConfig)
 		redoManager := m.(*FileRedoLogManager)
 
 		Ω(redoManager.currentLogFile).Should(BeNil())
@@ -77,8 +78,8 @@ var _ = ginkgo.Describe("redo_log_manager", func() {
 			return time.Unix(int64(5), 0)
 		})
 
-		f, _ := NewRedoLogManagerMaster(redoLogCfg, CreateMockDiskStore(), nil)
-		m, _ := f.NewRedologManager(table, shard, tableConfig)
+		f, _ := NewRedoLogManagerMaster(namespace, redoLogCfg, CreateMockDiskStore(), nil)
+		m, _ := f.NewRedologManager(table, shard, false, tableConfig)
 		redoManager := m.(*FileRedoLogManager)
 
 		buffer, _ := memCom.NewUpsertBatchBuilder().ToByteArray()
@@ -103,8 +104,8 @@ var _ = ginkgo.Describe("redo_log_manager", func() {
 		utils.SetClockImplementation(func() time.Time {
 			return time.Unix(int64(5), 0)
 		})
-		f, _ := NewRedoLogManagerMaster(redoLogCfg, CreateMockDiskStore(), nil)
-		m, _ := f.NewRedologManager(table, shard, tableConfig)
+		f, _ := NewRedoLogManagerMaster(namespace, redoLogCfg, CreateMockDiskStore(), nil)
+		m, _ := f.NewRedologManager(table, shard, false, tableConfig)
 		redoManager := m.(*FileRedoLogManager)
 
 		buffer, _ := memCom.NewUpsertBatchBuilder().ToByteArray()
@@ -132,8 +133,8 @@ var _ = ginkgo.Describe("redo_log_manager", func() {
 	ginkgo.It("works for Iterator iterator with 0 files", func() {
 		diskStore := &mocks.DiskStore{}
 		diskStore.On("ListLogFiles", mock.Anything, mock.Anything).Return([]int64{}, nil)
-		f, _ := NewRedoLogManagerMaster(redoLogCfg, diskStore, nil)
-		m, _ := f.NewRedologManager(table, shard, tableConfig)
+		f, _ := NewRedoLogManagerMaster(namespace, redoLogCfg, diskStore, nil)
+		m, _ := f.NewRedologManager(table, shard, false, tableConfig)
 		redoManager := m.(*FileRedoLogManager)
 
 		nextUpsertBatch, err := redoManager.Iterator()
@@ -164,8 +165,8 @@ var _ = ginkgo.Describe("redo_log_manager", func() {
 		diskStore.On("OpenLogFileForReplay", mock.Anything, mock.Anything, int64(1)).Return(file1, nil)
 		diskStore.On("OpenLogFileForReplay", mock.Anything, mock.Anything, int64(2)).Return(file2, nil)
 
-		f, _ := NewRedoLogManagerMaster(redoLogCfg, diskStore, nil)
-		m, _ := f.NewRedologManager(table, shard, tableConfig)
+		f, _ := NewRedoLogManagerMaster(namespace, redoLogCfg, diskStore, nil)
+		m, _ := f.NewRedologManager(table, shard, false, tableConfig)
 		redoManager := m.(*FileRedoLogManager)
 
 		nextUpsertBatch, _ := redoManager.Iterator()
@@ -174,7 +175,7 @@ var _ = ginkgo.Describe("redo_log_manager", func() {
 		Ω(batchInfo.Batch).ShouldNot(BeNil())
 		Ω(batchInfo.RedoLogFile).Should(Equal(int64(1)))
 
-		batchInfo  = nextUpsertBatch()
+		batchInfo = nextUpsertBatch()
 		Ω(batchInfo.Batch).ShouldNot(BeNil())
 		Ω(batchInfo.RedoLogFile).Should(Equal(int64(1)))
 
@@ -214,8 +215,8 @@ var _ = ginkgo.Describe("redo_log_manager", func() {
 		// magic header (uint32) + size (uint32) + correctBufferSize
 		diskStore.On("TruncateLogFile", "abc", 0, int64(2), int64(4+4+correctBufferSize)).Return(nil)
 
-		f, _ := NewRedoLogManagerMaster(redoLogCfg, diskStore, nil)
-		m, _ := f.NewRedologManager(table, shard, tableConfig)
+		f, _ := NewRedoLogManagerMaster(namespace, redoLogCfg, diskStore, nil)
+		m, _ := f.NewRedologManager(table, shard, false, tableConfig)
 		redoManager := m.(*FileRedoLogManager)
 
 		nextUpsertBatch, _ := redoManager.Iterator()
@@ -268,8 +269,8 @@ var _ = ginkgo.Describe("redo_log_manager", func() {
 		// magic header (uint32) + size (uint32) + correctBufferSize
 		diskStore.On("TruncateLogFile", "abc", 0, int64(2), int64(4+4+correctBufferSize)).Return(nil)
 
-		f, _ := NewRedoLogManagerMaster(redoLogCfg, diskStore, nil)
-		m, _ := f.NewRedologManager(table, shard, tableConfig)
+		f, _ := NewRedoLogManagerMaster(namespace, redoLogCfg, diskStore, nil)
+		m, _ := f.NewRedologManager(table, shard, false, tableConfig)
 		redoManager := m.(*FileRedoLogManager)
 
 		nextUpsertBatch, _ := redoManager.Iterator()
@@ -322,8 +323,8 @@ var _ = ginkgo.Describe("redo_log_manager", func() {
 		// magic header (uint32) + size (uint32) + correctBufferSize
 		diskStore.On("TruncateLogFile", "abc", 0, int64(2), int64(4+4+correctBufferSize)).Return(nil)
 
-		f, _ := NewRedoLogManagerMaster(redoLogCfg, diskStore, nil)
-		m, _ := f.NewRedologManager(table, shard, tableConfig)
+		f, _ := NewRedoLogManagerMaster(namespace, redoLogCfg, diskStore, nil)
+		m, _ := f.NewRedologManager(table, shard, false, tableConfig)
 		redoManager := m.(*FileRedoLogManager)
 
 		nextUpsertBatch, _ := redoManager.Iterator()
@@ -383,8 +384,8 @@ var _ = ginkgo.Describe("redo_log_manager", func() {
 		// magic header (uint32) + size (uint32) + correctBufferSize
 		diskStore.On("TruncateLogFile", "abc", 0, int64(2), int64(4+4+correctBufferSize)).Return(nil)
 
-		f, _ := NewRedoLogManagerMaster(redoLogCfg, diskStore, nil)
-		m, _ := f.NewRedologManager(table, shard, tableConfig)
+		f, _ := NewRedoLogManagerMaster(namespace, redoLogCfg, diskStore, nil)
+		m, _ := f.NewRedologManager(table, shard, false, tableConfig)
 		redoManager := m.(*FileRedoLogManager)
 
 		nextUpsertBatch, _ := redoManager.Iterator()
@@ -434,8 +435,8 @@ var _ = ginkgo.Describe("redo_log_manager", func() {
 		diskStore.On("OpenLogFileForReplay", mock.Anything, mock.Anything, int64(1)).Return(file1, nil)
 		diskStore.On("OpenLogFileForReplay", mock.Anything, mock.Anything, int64(2)).Return(file2, nil)
 		diskStore.On("OpenLogFileForReplay", mock.Anything, mock.Anything, int64(3)).Return(file3, nil)
-		f, _ := NewRedoLogManagerMaster(redoLogCfg, diskStore, nil)
-		m, _ := f.NewRedologManager(table, shard, tableConfig)
+		f, _ := NewRedoLogManagerMaster(namespace, redoLogCfg, diskStore, nil)
+		m, _ := f.NewRedologManager(table, shard, false, tableConfig)
 		redoManager := m.(*FileRedoLogManager)
 
 		nextUpsertBatch, _ := redoManager.Iterator()
@@ -478,8 +479,8 @@ var _ = ginkgo.Describe("redo_log_manager", func() {
 	ginkgo.It("CheckpointRedolog should work", func() {
 		diskStore := CreateMockDiskStore()
 		diskStore.On("DeleteLogFile", "abc", 0, mock.Anything).Return(nil)
-		f, _ := NewRedoLogManagerMaster(redoLogCfg, diskStore, nil)
-		m, _ := f.NewRedologManager(table, shard, tableConfig)
+		f, _ := NewRedoLogManagerMaster(namespace, redoLogCfg, diskStore, nil)
+		m, _ := f.NewRedologManager(table, shard, false, tableConfig)
 		redoManager := m.(*FileRedoLogManager)
 
 		redoManager.MaxEventTimePerFile[1] = 100

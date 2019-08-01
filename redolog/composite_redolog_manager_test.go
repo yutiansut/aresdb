@@ -53,7 +53,6 @@ var _ = ginkgo.Describe("composite redolog manager tests", func() {
 		MaxRedoLogFileSize:      10000000,
 	}
 	redoLogConfig := &common.RedoLogConfig{
-		Namespace: namespace,
 		DiskConfig: common.DiskRedoLogConfig{
 			Disabled: false,
 		},
@@ -71,10 +70,10 @@ var _ = ginkgo.Describe("composite redolog manager tests", func() {
 
 		mockMetaStore := createMockMetaStore()
 		consumer, _ := testing.MockKafkaConsumerFunc(nil)
-		f, err := NewKafkaRedoLogManagerMaster(redoLogConfig, &diskMocks.DiskStore{}, mockMetaStore, consumer)
+		f, err := NewKafkaRedoLogManagerMaster(namespace, redoLogConfig, &diskMocks.DiskStore{}, mockMetaStore, consumer)
 		Ω(err).Should(BeNil())
 		Ω(f).ShouldNot(BeNil())
-		m, err := f.NewRedologManager(table, shard, tableConfig)
+		m, err := f.NewRedologManager(table, shard, false, tableConfig)
 
 		Ω(err).Should(BeNil())
 		Ω(m).ShouldNot(BeNil())
@@ -92,12 +91,12 @@ var _ = ginkgo.Describe("composite redolog manager tests", func() {
 
 		nextUpsertBatch, err := cm.Iterator()
 		for i := 1; i <= 2*maxBatchesPerFile; i++ {
-			 batchInfo := nextUpsertBatch()
-			 if i < 6000 {
-			 	m.UpdateMaxEventTime(uint32(1), batchInfo.RedoLogFile)
-			 } else {
-				 m.UpdateMaxEventTime(uint32(utils.Now().Unix()), batchInfo.RedoLogFile)
-			 }
+			batchInfo := nextUpsertBatch()
+			if i < 6000 {
+				m.UpdateMaxEventTime(uint32(1), batchInfo.RedoLogFile)
+			} else {
+				m.UpdateMaxEventTime(uint32(utils.Now().Unix()), batchInfo.RedoLogFile)
+			}
 		}
 
 		// should not block
@@ -154,10 +153,10 @@ var _ = ginkgo.Describe("composite redolog manager tests", func() {
 
 		redoLogConfig.DiskConfig.Disabled = false
 		consumer, _ := testing.MockKafkaConsumerFunc(nil)
-		f, err := NewKafkaRedoLogManagerMaster(redoLogConfig, diskStore, mockMetaStore, consumer)
+		f, err := NewKafkaRedoLogManagerMaster(namespace, redoLogConfig, diskStore, mockMetaStore, consumer)
 		Ω(err).Should(BeNil())
 		Ω(f).ShouldNot(BeNil())
-		m, err := f.NewRedologManager(table, shard, tableConfig)
+		m, err := f.NewRedologManager(table, shard, false, tableConfig)
 		Ω(err).Should(BeNil())
 		Ω(m).ShouldNot(BeNil())
 

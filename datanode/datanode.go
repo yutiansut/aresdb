@@ -15,15 +15,17 @@
 package datanode
 
 import (
-	"errors"
 	"fmt"
-	"github.com/m3db/m3/src/x/instrument"
-	controllerCli "github.com/uber/aresdb/controller/client"
 	"net/http"
 	"net/http/pprof"
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/m3db/m3/src/x/instrument"
+	controllerCli "github.com/uber/aresdb/controller/client"
+
+	"strings"
 
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
@@ -47,7 +49,6 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
-	"strings"
 )
 
 // dataNode includes metastore, memstore and diskstore
@@ -69,13 +70,14 @@ type dataNode struct {
 	metrics  datanodeMetrics
 	handlers datanodeHandlers
 
-	bootstraps           int
 	bootstrapManager     BootstrapManager
 	redoLogManagerMaster *redolog.RedoLogManagerMaster
 	grpcServer           *grpc.Server
 
 	mapWatch topology.MapWatch
 	close    chan struct{}
+
+	readyCh chan struct{}
 }
 
 type datanodeHandlers struct {
@@ -101,7 +103,7 @@ func NewDataNode(
 	opts Options) (DataNode, error) {
 
 	iOpts := opts.InstrumentOptions()
-	logger := iOpts.Logger().With(zap.String("datanode", hostID))
+	logger := iOpts.Logger().With("datanode", hostID)
 
 	scope := iOpts.MetricsScope().SubScope("namespace").
 		Tagged(map[string]string{
@@ -118,7 +120,7 @@ func NewDataNode(
 	bootstrapToken := bootstrapServer.(memCom.BootStrapToken)
 
 	redologCfg := opts.ServerConfig().RedoLogConfig
-	redoLogManagerMaster, err := redolog.NewRedoLogManagerMaster(&redologCfg, diskStore, metaStore)
+	redoLogManagerMaster, err := redolog.NewRedoLogManagerMaster(opts.ServerConfig().Cluster.Namespace, &redologCfg, diskStore, metaStore)
 	if err != nil {
 		return nil, utils.StackError(err, "failed to initialize redolog manager master")
 	}
@@ -142,10 +144,11 @@ func NewDataNode(
 		redoLogManagerMaster: redoLogManagerMaster,
 		shardSet:             shard.NewShardSet(nil),
 		close:                make(chan struct{}),
+		readyCh:              make(chan struct{}),
 	}
 	d.handlers = d.newHandlers()
-	d.bootstrapManager = NewBootstrapManager(d, opts, topo)
-	clusterClient, err := d.opts.ServerConfig().InstanceConfig.Etcd.NewClient(instrument.NewOptions())
+	d.bootstrapManager = NewBootstrapManager(d.hostID, memStore, opts, topo)
+	clusterClient, err := d.opts.ServerConfig().Cluster.Etcd.NewClient(instrument.NewOptions())
 	if err != nil {
 		return nil, utils.StackError(err, "failed to create etcd client")
 	}
@@ -182,7 +185,7 @@ func (d *dataNode) Open() error {
 	case <-d.mapWatch.C():
 		hostShardSet, ok := d.mapWatch.Get().LookupHostShardSet(d.hostID)
 		if ok {
-			d.AssignShardSet(hostShardSet.ShardSet())
+			d.assignShardSet(hostShardSet.ShardSet())
 		}
 	default:
 	}
@@ -191,19 +194,23 @@ func (d *dataNode) Open() error {
 
 	// 5. start scheduler
 	if !d.opts.ServerConfig().SchedulerOff {
-		d.opts.InstrumentOptions().Logger().Info("starting scheduler")
+		d.logger.Info("starting scheduler")
 		// disable archiving during redolog replay
 		d.memStore.GetScheduler().EnableJobType(memCom.ArchivingJobType, false)
 		// this will start scheduler of all jobs except archiving, archiving will be started individually
 		d.memStore.GetScheduler().Start()
 	} else {
-		d.opts.InstrumentOptions().Logger().Info("scheduler is turned off")
+		d.logger.Info("scheduler is turned off")
 	}
 
-	// 6. start active topology watch
+	// 6. start table addition watch
+	go d.startTableAdditionWatch()
+	// 7. start active topology watch
 	go d.startActiveTopologyWatch()
-	// 7. start analyzing shard availability
+	// 8. start analyzing shard availability
 	go d.startAnalyzingShardAvailability()
+	// 9. start analyzing server readiness
+	go d.startAnalyzingServerReadiness()
 
 	return nil
 }
@@ -211,19 +218,19 @@ func (d *dataNode) Open() error {
 func (d *dataNode) startSchemaWatch() {
 	if d.opts.ServerConfig().Cluster.Enable {
 		// TODO better to reuse the code directly in controller to talk to etcd
-		if d.opts.ServerConfig().Cluster.ClusterName == "" {
+		if d.opts.ServerConfig().Cluster.Namespace == "" {
 			d.logger.Fatal("Missing cluster name")
 		}
-		controllerClientCfg := d.opts.ServerConfig().Gateway.Controller
+		controllerClientCfg := d.opts.ServerConfig().Cluster.Controller
 		if controllerClientCfg == nil {
 			d.logger.Fatal("Missing controller client config")
 		}
-		if d.opts.ServerConfig().Cluster.InstanceName != "" {
-			controllerClientCfg.Headers.Add(controllerCli.InstanceNameHeaderKey, d.opts.ServerConfig().Cluster.InstanceName)
+		if d.opts.ServerConfig().Cluster.InstanceID != "" {
+			controllerClientCfg.Headers.Add(controllerCli.InstanceNameHeaderKey, d.opts.ServerConfig().Cluster.InstanceID)
 		}
 
 		controllerClient := controllerCli.NewControllerHTTPClient(controllerClientCfg.Address, time.Duration(controllerClientCfg.TimeoutSec)*time.Second, controllerClientCfg.Headers)
-		schemaFetchJob := metastore.NewSchemaFetchJob(5*60, d.metaStore, metastore.NewTableSchameValidator(), controllerClient, d.opts.ServerConfig().Cluster.ClusterName, "")
+		schemaFetchJob := metastore.NewSchemaFetchJob(30, d.metaStore, nil, metastore.NewTableSchameValidator(), controllerClient, nil, d.opts.ServerConfig().Cluster.Namespace, "")
 		// immediate initial fetch
 		schemaFetchJob.FetchSchema()
 		go schemaFetchJob.Run()
@@ -257,21 +264,132 @@ func (d *dataNode) startDebugServer() {
 	d.opts.InstrumentOptions().Logger().Fatal(http.ListenAndServe(fmt.Sprintf(":%d", d.opts.ServerConfig().DebugPort), debugRouter))
 }
 
+func (d *dataNode) startTableAdditionWatch() {
+	shardOwnershipEvents, done, err := d.metaStore.WatchShardOwnershipEvents()
+	if err != nil {
+		utils.GetLogger().With("error", err.Error()).Fatal("failed to watch schema addition")
+	}
+
+	for {
+		select {
+		case <-d.close:
+			return
+		case event, ok := <-shardOwnershipEvents:
+			if !ok {
+				close(done)
+				return
+			}
+			d.addTable(event.TableName)
+			done <- struct{}{}
+		}
+	}
+}
+
 func (d *dataNode) startActiveTopologyWatch() {
 	for {
 		select {
 		case <-d.close:
 			return
-		case <-d.mapWatch.C():
+		case _, ok := <-d.mapWatch.C():
+			if !ok {
+				return
+			}
 			topoMap := d.mapWatch.Get()
 			hostShardSet, ok := topoMap.LookupHostShardSet(d.hostID)
 			if ok {
-				d.AssignShardSet(hostShardSet.ShardSet())
+				d.assignShardSet(hostShardSet.ShardSet())
 			} else {
 				// assign empty shard set when host does not appear in placement
-				d.AssignShardSet(shard.NewShardSet(nil))
-
+				d.assignShardSet(shard.NewShardSet(nil))
 			}
+		}
+	}
+}
+
+// checkShardReadiness check which of the shards are ready (meaning all tables within the shard are bootstrapped)
+// this function will partition the input shards into two parts with all ready shards in the first part
+// and return the number of ready shards
+// eg. given input shards [0, 1, 2, 3, 4, 5, 6, 7], if all tables in shard 2, 6 are bootstrapped
+// when the algorithm is finished,
+// the input shards slice will become [2, 6, 0, 1, 3, 4, 5, 7],
+// and numReadyShards returned is 2
+func (d *dataNode) checkShardReadiness(tables []string, shards []uint32) (numReadyShards int) {
+	for i := 0; i < len(shards); i++ {
+		shardID := shards[i]
+		numTablesBootstrapped := 0
+		for _, table := range tables {
+			tableShard, err := d.memStore.GetTableShard(table, int(shardID))
+			if err != nil {
+				d.logger.With(
+					"error", err.Error(),
+					"table", table,
+					"shard", shardID).
+					Error("cannot get table shard")
+				continue
+			}
+			if tableShard.IsBootstrapped() {
+				numTablesBootstrapped++
+			}
+			tableShard.Users.Done()
+		}
+
+		if numTablesBootstrapped == len(tables) {
+			shards[i], shards[numReadyShards] = shards[numReadyShards], shards[i]
+			numReadyShards++
+		}
+	}
+	return
+}
+
+func (d *dataNode) startAnalyzingServerReadiness() {
+	ticker := time.NewTicker(10 * time.Second)
+	for {
+		select {
+		case <-ticker.C:
+		case <-d.close:
+			return
+		}
+
+		nonInitializing := make([]uint32, 0)
+
+		// condition for serving readiness
+		// 1. no shards owned by server
+		hostShardSet, ok := d.mapWatch.Get().LookupHostShardSet(d.hostID)
+		if !ok {
+			close(d.readyCh)
+			return
+		}
+
+		for _, s := range hostShardSet.ShardSet().All() {
+			if s.State() != m3Shard.Initializing {
+				nonInitializing = append(nonInitializing, s.ID())
+			}
+		}
+
+		// 2. no nonInitializing (available/leaving) shards waiting for bootstrap
+		if len(nonInitializing) == 0 {
+			close(d.readyCh)
+			return
+		}
+
+		factTables := make([]string, 0)
+		dimTables := make([]string, 0)
+		d.memStore.RLock()
+		for table, schema := range d.memStore.GetSchemas() {
+			if !schema.Schema.IsFactTable {
+				dimTables = append(dimTables, table)
+			} else {
+				factTables = append(factTables, table)
+			}
+		}
+		d.memStore.RUnlock()
+
+		// 3. all nonInitializing (available/leaving) shards are bootstrapped
+		// and all dimension table shards are bootstrapped (only one shard for dim table)
+		if d.checkShardReadiness(factTables, nonInitializing) == len(nonInitializing) &&
+			d.checkShardReadiness(dimTables, []uint32{0}) == 1 {
+			close(d.readyCh)
+			return
 		}
 	}
 }
@@ -290,56 +408,44 @@ func (d *dataNode) startAnalyzingShardAvailability() {
 			continue
 		}
 
-		initializing := make(map[uint32]m3Shard.Shard)
+		// initializing shards are shards with Initializing State
+		// nonInitializing shards are shards with Available and Leaving State
+		// we always bootstrap nonInitializing shards first
+		// and wait for nonInitializing shards's readiness before serving traffic
+		initializing := make([]uint32, 0)
 		for _, s := range hostShardSet.ShardSet().All() {
 			if s.State() == m3Shard.Initializing {
-				initializing[s.ID()] = s
+				initializing = append(initializing, s.ID())
 			}
 		}
 
-		if len(initializing) == 0 {
-			continue
-		}
-
-		dynamicTopo, ok := d.topo.(topology.DynamicTopology)
-		if !ok {
-			d.logger.Error("cannot mark shard available", zap.Error(errors.New("topology is not dynamic")))
-			continue
-		}
-
-		tables := d.Tables()
-		availableShards := make([]uint32, 0, len(initializing))
-		// check all whether all tables within initialing shards are bootstrapped
-		for shardID := range initializing {
-			numTablesBootstrapped := 0
-			for _, table := range tables {
-				tableShard, err := d.memStore.GetTableShard(table, int(shardID))
-				if err != nil {
-					d.logger.Error("cannot get table shard",
-						zap.Error(err),
-						zap.String("table", table),
-						zap.Uint32("shard", shardID))
-					continue
+		if len(initializing) > 0 {
+			// snapshot fact tables
+			factTables := make([]string, 0)
+			d.memStore.RLock()
+			for table, schema := range d.memStore.GetSchemas() {
+				if schema.Schema.IsFactTable {
+					factTables = append(factTables, table)
 				}
-				if tableShard.IsBootstrapped() {
-					numTablesBootstrapped++
-				}
-				tableShard.Users.Done()
 			}
-			if numTablesBootstrapped == len(tables) {
-				availableShards = append(availableShards, shardID)
-			}
-		}
+			d.memStore.RUnlock()
 
-		if len(availableShards) > 0 {
-			if err := dynamicTopo.MarkShardsAvailable(d.hostID, availableShards...); err != nil {
-				d.logger.Error("failed to mark shards as available", zap.Uint32s("shards", availableShards), zap.Error(err))
-			} else {
-				d.logger.Error("successfully marked shards as available", zap.Uint32s("shards", availableShards))
+			dynamicTopo, ok := d.topo.(topology.DynamicTopology)
+			if !ok {
+				d.logger.Error("cannot mark shard available, topology is not dynamic")
+				return
+			}
+			if numAvailable := d.checkShardReadiness(factTables, initializing); numAvailable > 0 {
+				availableShards := initializing[:numAvailable]
+				if err := dynamicTopo.MarkShardsAvailable(d.hostID, availableShards...); err != nil {
+					d.logger.With(zap.Uint32s("shards", availableShards), "error", err.Error()).
+						Error("failed to mark shards as available", zap.Error(err))
+				} else {
+					d.logger.With(zap.Uint32s("shards", availableShards)).Info("successfully marked shards as available")
+				}
 			}
 		}
 	}
-
 }
 
 // Options returns the database options.
@@ -352,22 +458,14 @@ func (d *dataNode) ShardSet() shard.ShardSet {
 	return d.shardSet
 }
 
-// Tables returns the actual tables owned by datanode
-func (d *dataNode) Tables() (tables []string) {
-	d.memStore.RLock()
-	defer d.memStore.RUnlock()
-	schemas := d.memStore.GetSchemas()
-	for name := range schemas {
-		tables = append(tables, name)
-	}
-	return
-}
-
 func (d *dataNode) ID() string {
 	return d.hostID
 }
 
 func (d *dataNode) Serve() {
+	// wait for server is ready to serve
+	<-d.readyCh
+
 	// start advertising to the cluster
 	d.advertise()
 	// enable archiving jobs
@@ -412,17 +510,15 @@ func (d *dataNode) Serve() {
 
 func (d *dataNode) advertise() {
 	serviceID := services.NewServiceID().
-		SetEnvironment(d.opts.ServerConfig().InstanceConfig.Etcd.Env).
-		SetZone(d.opts.ServerConfig().InstanceConfig.Etcd.Zone).
-		SetName(utils.DataNodeServiceName(d.opts.ServerConfig().InstanceConfig.Namespace))
+		SetEnvironment(d.opts.ServerConfig().Cluster.Etcd.Env).
+		SetZone(d.opts.ServerConfig().Cluster.Etcd.Zone).
+		SetName(utils.DataNodeServiceName(d.opts.ServerConfig().Cluster.Namespace))
 
 	err := d.clusterServices.SetMetadata(serviceID, services.NewMetadata().
-		SetHeartbeatInterval(time.Duration(d.opts.ServerConfig().InstanceConfig.HeartbeatConfig.Interval)*time.Second).
-		SetLivenessInterval(time.Duration(d.opts.ServerConfig().InstanceConfig.HeartbeatConfig.Timeout)*time.Second))
+		SetHeartbeatInterval(time.Duration(d.opts.ServerConfig().Cluster.HeartbeatConfig.Interval)*time.Second).
+		SetLivenessInterval(time.Duration(d.opts.ServerConfig().Cluster.HeartbeatConfig.Timeout)*time.Second))
 	if err != nil {
-		d.opts.InstrumentOptions().Logger().Fatalf("failed to set heart beat metadata",
-			zap.String("id", d.hostID),
-			zap.Error(err))
+		d.logger.With("error", err.Error()).Fatalf("failed to set heart beat metadata")
 	}
 
 	placementInstance := placement.NewInstance().SetID(d.hostID)
@@ -432,39 +528,85 @@ func (d *dataNode) advertise() {
 
 	err = d.clusterServices.Advertise(ad)
 	if err != nil {
-		d.opts.InstrumentOptions().Logger().Fatalf("failed to advertise data node",
-			zap.String("id", d.hostID),
-			zap.Error(err))
+		d.logger.With("error", err.Error()).Fatalf("failed to advertise data node")
 	} else {
-		d.opts.InstrumentOptions().Logger().Info("start advertising datanode to cluster",
-			zap.String("id", d.hostID))
+		d.logger.Info("start advertising datanode to cluster")
 	}
 }
 
-// GetTableShard returns the table shard from the datanode
-func (d *dataNode) GetTableShard(table string, shardID uint32) (*memstore.TableShard, error) {
-	return d.memStore.GetTableShard(table, int(shardID))
-}
-
-func (d *dataNode) AssignShardSet(shardSet shard.ShardSet) {
+func (d *dataNode) addTable(table string) {
 	d.Lock()
 	defer d.Unlock()
 
-	tables := d.Tables()
+	d.memStore.RLock()
+	schema := d.memStore.GetSchemas()[table]
+	d.memStore.RUnlock()
+	if schema == nil {
+		d.logger.With("table", table).Error("schema does not exist")
+		return
+	}
+	isFactTable := schema.Schema.IsFactTable
+
+	if !isFactTable {
+		d.logger.With("table", table, "shard", 0).Info("adding table shard on schema addition")
+		// dimension table defaults shard to zero
+		// new table does not need to copy data from peer
+		d.memStore.AddTableShard(table, 0, false)
+	} else {
+		for _, shardID := range d.shardSet.AllIDs() {
+			d.logger.With("table", table, "shard", shardID).Info("adding table shard on schema addition")
+			// new table does not need to copy data from peer
+			d.memStore.AddTableShard(table, int(shardID), false)
+		}
+	}
+
+	go func() {
+		if err := d.bootstrapManager.Bootstrap(); err != nil {
+			d.logger.With("error", err.Error()).Error("error while bootstrapping")
+		}
+	}()
+}
+
+func (d *dataNode) assignShardSet(shardSet shard.ShardSet) {
+	d.Lock()
+	defer d.Unlock()
+
+	// process fact tables first
+	d.memStore.RLock()
+	factTables := make([]string, 0)
+	dimensionTables := make([]string, 0)
+	for table, schema := range d.memStore.GetSchemas() {
+		if schema.Schema.IsFactTable {
+			factTables = append(factTables, table)
+		} else {
+			dimensionTables = append(dimensionTables, table)
+		}
+	}
+	d.memStore.RUnlock()
+
 	var (
-		incoming = make(map[uint32]m3Shard.Shard, len(shardSet.All()))
-		existing = make(map[uint32]struct{}, len(d.shardSet.AllIDs()))
-		removing []uint32
-		adding   []m3Shard.Shard
+		incoming           = make(map[uint32]m3Shard.Shard, len(shardSet.All()))
+		existing           = make(map[uint32]struct{}, len(d.shardSet.AllIDs()))
+		removing           []uint32
+		adding             []m3Shard.Shard
+		initializingShards = 0
+		noExistingShards   bool
+		noShardLeft        bool
 	)
 
 	for _, shard := range shardSet.All() {
+		if shard.State() == m3Shard.Initializing {
+			initializingShards++
+		}
 		incoming[shard.ID()] = shard
 	}
 
 	for _, shardID := range d.shardSet.AllIDs() {
 		existing[shardID] = struct{}{}
 	}
+
+	noExistingShards = len(existing) == 0
+	noShardLeft = len(incoming) == 0
 
 	for shardID := range existing {
 		if _, ok := incoming[shardID]; !ok {
@@ -479,28 +621,51 @@ func (d *dataNode) AssignShardSet(shardSet shard.ShardSet) {
 	}
 
 	for _, shardID := range removing {
-		for _, table := range tables {
-			d.logger.With("table", table, "shard", shardID).Info("removing table shard on placement change")
+		for _, table := range factTables {
+			d.logger.With("table", table, "shard", shardID).Info("removing fact table shard on placement change")
 			d.memStore.RemoveTableShard(table, int(shardID))
+			d.diskStore.DeleteTableShard(table, int(shardID))
 		}
 	}
 
 	for _, shard := range adding {
-		for _, table := range tables {
-			d.logger.With("table", table, "shard", shard.ID(), "state", shard.State()).Info("adding table shard on placement change")
-			d.memStore.AddTableShard(table, int(shard.ID()), shard.State() == m3Shard.Initializing)
+		needPeerCopy := shard.State() == m3Shard.Initializing
+		for _, table := range factTables {
+			d.logger.With("table", table, "shard", shard.ID(), "state", shard.State()).Info("adding fact table shard on placement change")
+			d.memStore.AddTableShard(table, int(shard.ID()), needPeerCopy)
+		}
+	}
+
+	// add/remove dimension tables with the following rules:
+	// 1. add dimension tables when first shard is assigned to the data node
+	// 2. remove dimension tables when the last shard is removed from the data node
+	// 3. copy dimension table data from peer when all assigned new shards are initializing shards
+	if noExistingShards && !noShardLeft {
+		// only need to copy data from peer when all new shards are initializing shards
+		// meaning no available/leaving shards ever owned by this data node
+		needPeerCopy := initializingShards > 0 && len(incoming) == initializingShards
+		for _, table := range dimensionTables {
+			d.logger.With("table", table, "shard", 0).Info("adding dimension table shard on placement change")
+			// only copy data from peer for dimension table
+			// when from zero shards to all initialing shards
+			d.memStore.AddTableShard(table, 0, needPeerCopy)
+		}
+	}
+
+	if !noExistingShards && noShardLeft {
+		for _, table := range dimensionTables {
+			d.logger.With("table", table, "shard", 0).Info("removing dimension table shard on placement change")
+			d.memStore.RemoveTableShard(table, 0)
+			d.diskStore.DeleteTableShard(table, 0)
 		}
 	}
 	d.shardSet = shardSet
 
-	// only kick off bootstrap when the first bootstrap is done during shard assignment
-	if d.bootstraps > 0 {
-		go func() {
-			if err := d.bootstrapManager.Bootstrap(); err != nil {
-				d.logger.Error("error while bootstrapping", zap.Error(err))
-			}
-		}()
-	}
+	go func() {
+		if err := d.bootstrapManager.Bootstrap(); err != nil {
+			d.logger.With("error", err.Error()).Error("error while bootstrapping")
+		}
+	}()
 }
 
 // GetOwnedShards returns all shard ids the datanode owns
@@ -513,13 +678,6 @@ func (d *dataNode) GetOwnedShards() []int {
 		ids[i] = int(shardID)
 	}
 	return ids
-}
-
-func (d *dataNode) Bootstrap() error {
-	d.Lock()
-	d.bootstraps++
-	d.Unlock()
-	return d.bootstrapManager.Bootstrap()
 }
 
 func newDatanodeMetrics(scope tally.Scope) datanodeMetrics {

@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
+	"github.com/m3db/m3/src/cluster/kv"
 	"github.com/m3db/m3/src/cluster/services"
 	"github.com/m3db/m3/src/x/instrument"
 	"github.com/mitchellh/mapstructure"
@@ -30,6 +31,7 @@ import (
 	"github.com/uber/aresdb/cmd/aresd/cmd"
 	"github.com/uber/aresdb/common"
 	"github.com/uber/aresdb/controller/client"
+	controllerEtcd "github.com/uber/aresdb/controller/mutators/etcd"
 	dataNodeCli "github.com/uber/aresdb/datanode/client"
 	"github.com/uber/aresdb/metastore"
 	"github.com/uber/aresdb/utils"
@@ -84,46 +86,74 @@ func start(cfg config.BrokerConfig, logger common.Logger, queryLogger common.Log
 	defer closer.Close()
 
 	// Init common components.
-	utils.Init(common.AresServerConfig{}, logger, queryLogger, scope, utils.ReporterTypeBroker)
+	utils.Init(common.AresServerConfig{}, logger, queryLogger, scope)
 
 	scope.Counter("restart").Inc(1)
 	serverRestartTimer := scope.Timer("restart").Start()
 	defer serverRestartTimer.Stop()
 
 	// fetch and keep syncing schema
-	controllerClientCfg := cfg.ControllerConfig
+	controllerClientCfg := cfg.Cluster.Controller
 	if controllerClientCfg == nil {
 		logger.Fatal("Missing controller client config", err)
 	}
 
-	clusterName := cfg.Cluster.ClusterName
-	controllerClient := client.NewControllerHTTPClient(controllerClientCfg.Address, time.Duration(controllerClientCfg.TimeoutSec)*time.Second, controllerClientCfg.Headers)
-	schemaMutator := broker.NewBrokerSchemaMutator()
-	schemaFetchJob := metastore.NewSchemaFetchJob(10, schemaMutator, metastore.NewTableSchameValidator(), controllerClient, clusterName, "")
-	schemaFetchJob.FetchSchema()
-	go schemaFetchJob.Run()
+	var (
+		topo        topology.HealthTrackingDynamicTopoloy
+		clusterName = cfg.Cluster.Namespace
+		serviceName = utils.BrokerServiceName(clusterName)
+		store       kv.TxnStore
+	)
 
-	var topo topology.Topology
-
-	serviceName := utils.BrokerServiceName(clusterName)
-
-	cfg.Etcd.Service = serviceName
-	configServiceCli, err := cfg.Etcd.NewClient(
+	cfg.Cluster.Etcd.Service = serviceName
+	configServiceCli, err := cfg.Cluster.Etcd.NewClient(
 		instrument.NewOptions().SetLogger(zap.NewExample()))
 	if err != nil {
 		logger.Fatal("Failed to create config service client,", err)
 	}
-	dynamicOptions := topology.NewDynamicOptions().SetConfigServiceClient(configServiceCli).SetServiceID(services.NewServiceID().SetZone(cfg.Etcd.Zone).SetName(serviceName).SetEnvironment(cfg.Etcd.Env))
-	topo, err = topology.NewDynamicInitializer(dynamicOptions).Init()
+
+	controllerClient := client.NewControllerHTTPClient(
+		controllerClientCfg.Address,
+		time.Duration(controllerClientCfg.TimeoutSec)*time.Second,
+		controllerClientCfg.Headers,
+	)
+	brokerSchemaMutator := broker.NewBrokerSchemaMutator()
+
+	store, err = configServiceCli.Txn()
 	if err != nil {
-		logger.Fatal("Failed to initialize dynamic topology,", err)
+		logger.Fatal("Failed to get kv store")
+	}
+
+	schemaFetchJob := metastore.NewSchemaFetchJob(
+		10,
+		brokerSchemaMutator,
+		brokerSchemaMutator,
+		metastore.NewTableSchameValidator(),
+		controllerClient,
+		controllerEtcd.NewEnumMutator(
+			store, controllerEtcd.NewTableSchemaMutator(
+				store,
+				zap.NewExample().Sugar(),
+			),
+		),
+		clusterName,
+		"",
+	)
+	schemaFetchJob.FetchSchema()
+	schemaFetchJob.FetchEnum()
+	go schemaFetchJob.Run()
+
+	dynamicOptions := topology.NewDynamicOptions().SetConfigServiceClient(configServiceCli).SetServiceID(services.NewServiceID().SetZone(cfg.Cluster.Etcd.Zone).SetName(serviceName).SetEnvironment(cfg.Cluster.Etcd.Env))
+	topo, err = topology.NewHealthTrackingDynamicTopology(dynamicOptions)
+	if err != nil {
+		logger.Fatal("Failed to create health tracking dynamic topology,", err)
 	}
 
 	// executor
-	exec := broker.NewQueryExecutor(schemaMutator, topo, dataNodeCli.NewDataNodeQueryClient())
+	exec := broker.NewQueryExecutor(brokerSchemaMutator, topo, dataNodeCli.NewDataNodeQueryClient())
 
 	// init handlers
-	queryHandler := broker.NewQueryHandler(exec)
+	queryHandler := broker.NewQueryHandler(exec, cfg.Cluster.InstanceID)
 
 	// start HTTP server
 	router := mux.NewRouter()

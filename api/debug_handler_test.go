@@ -65,10 +65,7 @@ func convertToAPIError(err error) error {
 
 var _ = ginkgo.Describe("DebugHandler", func() {
 
-	testFactory := memstore.TestFactoryT{
-		RootPath:   "../testing/data",
-		FileSystem: utils.OSFileSystem{},
-	}
+	testFactory := memstore.GetFactory()
 
 	testTableName := "test"
 	testTableShardID := 1
@@ -121,7 +118,7 @@ var _ = ginkgo.Describe("DebugHandler", func() {
 	ginkgo.BeforeEach(func() {
 		testBatch, _ := testFactory.ReadArchiveBatch("archiveBatch")
 		testArchiveBatch := memstore.ArchiveBatch{
-			Batch: memstore.Batch{
+			Batch: memCom.Batch{
 				RWMutex: &sync.RWMutex{},
 				Columns: testBatch.Columns,
 			},
@@ -174,11 +171,11 @@ var _ = ginkgo.Describe("DebugHandler", func() {
 		liveBatch := testShard.LiveStore.GetBatchForWrite(memstore.BaseBatchID)
 		liveBatch.Unlock()
 		vp := liveBatch.GetOrCreateVectorParty(5, false)
-		vp.SetDataValue(0, memCom.DataValue{Valid: true}, memstore.IgnoreCount)
+		vp.SetDataValue(0, memCom.DataValue{Valid: true}, memCom.IgnoreCount)
 
 		var val uint8 = 0
 		vp = liveBatch.GetOrCreateVectorParty(6, false)
-		vp.SetDataValue(0, memCom.DataValue{Valid: true, OtherVal: unsafe.Pointer(&val)}, memstore.IgnoreCount)
+		vp.SetDataValue(0, memCom.DataValue{Valid: true, OtherVal: unsafe.Pointer(&val)}, memCom.IgnoreCount)
 
 		// redolog table.
 		redoLogTable, err := testMetaStore.GetTable(redoLogTableName)
@@ -186,7 +183,7 @@ var _ = ginkgo.Describe("DebugHandler", func() {
 		redoLogTableSchema := &memCom.TableSchema{
 			Schema: *redoLogTable,
 		}
-		redoManagerFactory, _ := redolog.NewRedoLogManagerMaster(&common.RedoLogConfig{}, mockDiskStore, mockMetaStore)
+		redoManagerFactory, _ := redolog.NewRedoLogManagerMaster("", &common.RedoLogConfig{}, mockDiskStore, mockMetaStore)
 
 		options := memstore.NewOptions(new(memComMocks.BootStrapToken), redoManagerFactory)
 		redoLogShard := memstore.NewTableShard(redoLogTableSchema, mockMetaStore, testDiskStore, CreateMockHostMemoryManger(), redoLogShardID, options)
@@ -597,6 +594,8 @@ var _ = ginkgo.Describe("DebugHandler", func() {
     "primaryKeyColumnTypes": []
   },
   "bootstrapDetails": {
+	"source": "",
+	"startedAt": 0,
     "stage": "waiting",
     "numColumns": 0,
     "batches": {}

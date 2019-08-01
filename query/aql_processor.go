@@ -662,24 +662,6 @@ func asyncCopyDimensionVector(toDimVector, fromDimVector unsafe.Pointer, length,
 	}
 }
 
-// dimValueVectorSize returns the size of final dim value vector on host side.
-func dimValResVectorSize(resultSize int, numDimsPerDimWidth queryCom.DimCountsPerDimWidth) int {
-	totalDims := 0
-	for _, numDims := range numDimsPerDimWidth {
-		totalDims += int(numDims)
-	}
-
-	dimBytes := 1 << uint(len(numDimsPerDimWidth)-1)
-	var totalBytes int
-	for _, numDims := range numDimsPerDimWidth {
-		totalBytes += dimBytes * resultSize * int(numDims)
-		dimBytes >>= 1
-	}
-
-	totalBytes += totalDims * resultSize
-	return totalBytes
-}
-
 // cleanupDeviceResultBuffers cleans up result buffers and resets result fields.
 func (bc *oopkBatchContext) cleanupDeviceResultBuffers() {
 	deviceFreeAndSetNil(&bc.dimensionVectorD[0])
@@ -829,7 +811,7 @@ func (qc *AQLQueryContext) doProfile(action func(), profileName string, stream u
 // a function closure to be invoked later. customFilterExecutor is the executor
 // to apply custom filters for live batch and archive batch.
 func (qc *AQLQueryContext) processBatch(
-	batch *memstore.Batch, batchID int32, batchSize int, transferFunc batchTransferExecutor,
+	batch *memCom.Batch, batchID int32, batchSize int, transferFunc batchTransferExecutor,
 	customFilterFunc customFilterExecutor, previousBatchExecutor BatchExecutor, needToUnlockBatch bool) BatchExecutor {
 	defer func() {
 		if needToUnlockBatch {

@@ -16,6 +16,7 @@ package common
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"github.com/uber/aresdb/utils"
 	"strconv"
@@ -92,6 +93,64 @@ func CompareFloat32(a, b unsafe.Pointer) int {
 	}
 }
 
+// CompareUUID compare UUID values
+func CompareUUID(a, b unsafe.Pointer) int {
+	uuid1 := *(*[2]uint64)(a)
+	uuid2 := *(*[2]uint64)(b)
+	var res int
+	if res = int(uuid1[0] - uuid2[0]); res == 0 {
+		res = int(uuid1[1] - uuid2[1])
+	}
+	return res
+}
+
+// CompareGeoPoint compare GeoPoint Values
+func CompareGeoPoint(a, b unsafe.Pointer) int {
+	point1 := *(*[2]float32)(a)
+	point2 := *(*[2]float32)(b)
+	var val float32
+	if val = point1[0] - point2[0]; val == 0 {
+		val = point1[1] - point2[1]
+	}
+	if val == 0 {
+		return 0
+	} else if val > 0 {
+		return 1
+	}
+	return -1
+}
+
+// CompareArray compare array values, the main purpose of this comparsion is for equal comparison
+// larger/less comparision may not be accurate
+func CompareArray(dataType DataType, a, b unsafe.Pointer) int {
+	len1 := int(*(*uint32)(a))
+	len2 := int(*(*uint32)(b))
+	if len1 != len2 {
+		return len1 - len2
+	}
+	if len1 == 0 {
+		return 0
+	}
+	bytes := CalculateListElementBytes(dataType, len1)
+	// skip 4 bytes for length
+	return utils.MemCmp(a, b, 4, bytes)
+}
+
+// ArrayLengthCompare compare
+func ArrayLengthCompare(v1, v2 *DataValue) int {
+	if !v1.Valid && v2.Valid {
+		return 1
+	} else if v1.Valid && !v2.Valid {
+		return -1
+	} else if !v1.Valid && !v2.Valid {
+		return 0
+	}
+
+	len1 := int(*(*uint32)(v1.OtherVal))
+	len2 := int(*(*uint32)(v2.OtherVal))
+	return len1 - len2
+}
+
 // GetCompareFunc get the compare function for specific data type
 func GetCompareFunc(dataType DataType) CompareFunc {
 	switch dataType {
@@ -111,6 +170,10 @@ func GetCompareFunc(dataType DataType) CompareFunc {
 		return CompareInt64
 	case Float32:
 		return CompareFloat32
+	case UUID:
+		return CompareUUID
+	case GeoPoint:
+		return CompareGeoPoint
 	}
 	return nil
 }
@@ -147,6 +210,14 @@ type GeoShapeGo struct {
 	Polygons [][]GeoPointGo
 }
 
+// Array value representation in Go for UpsertBatch
+type ArrayValue struct {
+	// item data type
+	DataType DataType
+	// item list
+	Items []interface{}
+}
+
 // Compare compares two value wrapper.
 func (v1 DataValue) Compare(v2 DataValue) int {
 	if !v1.Valid || !v2.Valid {
@@ -157,6 +228,9 @@ func (v1 DataValue) Compare(v2 DataValue) int {
 	}
 	if v1.CmpFunc != nil {
 		return v1.CmpFunc(v1.OtherVal, v2.OtherVal)
+	}
+	if IsArrayType(v1.DataType) {
+		return CompareArray(v1.DataType, v1.OtherVal, v2.OtherVal)
 	}
 	return 0
 }
@@ -211,11 +285,43 @@ func (v1 DataValue) ConvertToHumanReadable(dataType DataType) interface{} {
 				pointsStrs := make([]string, len(points))
 				for j, point := range points {
 					// in string format, lng goes first and lat second
+					// https://en.wikipedia.org/wiki/Well-known_text_representation_of_geometry
 					pointsStrs[j] = fmt.Sprintf("%.4f+%.4f", point[1], point[0])
 				}
 				polygons[i] = fmt.Sprintf("(%s)", strings.Join(pointsStrs, ","))
 			}
 			return fmt.Sprintf("Polygon(%s)", strings.Join(polygons, ","))
+		}
+	default:
+		if IsArrayType(dataType) {
+			reader := NewArrayValueReader(dataType, v1.OtherVal)
+			num := reader.GetLength()
+			arrVal := make([]interface{}, num)
+
+			for i := 0; i < int(num); i++ {
+				if reader.IsValid(i) {
+					var dataValue DataValue
+					if reader.itemType == Bool {
+						dataValue = DataValue{
+							DataType: reader.itemType,
+							Valid:    true,
+							IsBool:   true,
+							BoolVal:  reader.GetBool(i),
+						}
+					} else {
+						dataValue = DataValue{
+							DataType: reader.itemType,
+							Valid:    true,
+							OtherVal: reader.Get(i),
+						}
+					}
+					arrVal[i] = dataValue.ConvertToHumanReadable(reader.itemType)
+				} else {
+					arrVal[i] = nil
+				}
+			}
+			bytes, _ := json.Marshal(arrVal)
+			return string(bytes)
 		}
 	}
 	return nil
@@ -351,6 +457,27 @@ func ValueFromString(str string, dataType DataType) (val DataValue, err error) {
 		val.OtherVal = unsafe.Pointer(&point[0])
 		return
 	default:
+		if IsArrayType(dataType) {
+			var value interface{}
+			value, err = ArrayValueFromString(str, GetItemDataType(dataType))
+			if err != nil {
+				err = utils.StackError(err, "Failed to read array string: %s", str)
+				return
+			}
+			arrayValue := value.(*ArrayValue)
+			bytes := arrayValue.GetSerBytes()
+			buffer := make([]byte, bytes)
+			valueWriter := utils.NewBufferWriter(buffer)
+			err = arrayValue.Write(&valueWriter)
+			if err != nil {
+				err = utils.StackError(err, "Unable to write array value to buffer: %s", str)
+				return
+			}
+
+			val.Valid = true
+			val.OtherVal = unsafe.Pointer(&buffer[0])
+			return
+		}
 		err = utils.StackError(nil, "Unsupported data type value %#x", dataType)
 		return
 	}
@@ -437,4 +564,212 @@ func (gs *GeoShapeGo) Write(dataWriter *utils.StreamDataWriter) error {
 		}
 	}
 	return dataWriter.WritePadding(int(dataWriter.GetBytesWritten()), 4)
+}
+
+// GetLength return item numbers for the array value
+func (av *ArrayValue) GetLength() int {
+	return len(av.Items)
+}
+
+// AddItem add new item into array
+func (av *ArrayValue) AddItem(item interface{}) {
+	av.Items = append(av.Items, item)
+}
+
+// GetSerBytes return the bytes will be used in upsertbatch serialized format
+func (av *ArrayValue) GetSerBytes() int {
+	return CalculateListElementBytes(av.DataType, av.GetLength())
+}
+
+// NewArrayValue create a new ArrayValue instance
+func NewArrayValue(dataType DataType) *ArrayValue {
+	return &ArrayValue{
+		DataType: dataType,
+		Items:    make([]interface{}, 0),
+	}
+}
+
+// Write serialize data into writer
+// Serialized Array data format:
+// number of items: 4 bytes
+// item values: per item bytes * number of items, align to byte
+// item validity:  1 bit * number of items
+// final align to 8 bytes
+func (av *ArrayValue) Write(writer *utils.BufferWriter) error {
+	num := av.GetLength()
+	err := writer.AppendUint32(uint32(num))
+	if err != nil {
+		return err
+	}
+	// add value for each item
+	for _, val := range av.Items {
+		switch av.DataType {
+		case Bool:
+			if val == nil {
+				err = writer.AppendBool(false)
+			} else {
+				err = writer.AppendBool(val.(bool))
+			}
+		case Int8:
+			if val == nil {
+				err = writer.AppendInt8(0)
+			} else {
+				err = writer.AppendInt8(val.(int8))
+			}
+		case Uint8, SmallEnum:
+			if val == nil {
+				err = writer.AppendUint8(0)
+			} else {
+				err = writer.AppendUint8(val.(uint8))
+			}
+		case Int16:
+			if val == nil {
+				err = writer.AppendInt16(0)
+			} else {
+				err = writer.AppendInt16(val.(int16))
+			}
+		case Uint16, BigEnum:
+			if val == nil {
+				err = writer.AppendUint16(0)
+			} else {
+				err = writer.AppendUint16(val.(uint16))
+			}
+		case Int32:
+			if val == nil {
+				err = writer.AppendInt32(0)
+			} else {
+				err = writer.AppendInt32(val.(int32))
+			}
+		case Uint32:
+			if val == nil {
+				err = writer.AppendUint32(0)
+			} else {
+				err = writer.AppendUint32(val.(uint32))
+			}
+		case Float32:
+			if val == nil {
+				err = writer.AppendFloat32(0)
+			} else {
+				err = writer.AppendFloat32(val.(float32))
+			}
+		case Int64:
+			if val == nil {
+				err = writer.AppendInt64(0)
+			} else {
+				err = writer.AppendInt64(val.(int64))
+			}
+		case UUID:
+			if val == nil {
+				err = writer.AppendUint64(0)
+				if err == nil {
+					err = writer.AppendUint64(0)
+				}
+			} else {
+				err := writer.AppendUint64(val.([2]uint64)[0])
+				if err == nil {
+					err = writer.AppendUint64(val.([2]uint64)[1])
+				}
+			}
+		case GeoPoint:
+			if val == nil {
+				err = writer.AppendFloat32(0)
+				if err == nil {
+					err = writer.AppendFloat32(0)
+				}
+			} else {
+				err := writer.AppendFloat32(val.([2]float32)[0])
+				if err == nil {
+					err = writer.AppendFloat32(val.([2]float32)[1])
+				}
+			}
+		}
+		if err != nil {
+			return err
+		}
+	}
+	writer.AlignBytes(1)
+
+	// add validity bit for each item
+	for _, val := range av.Items {
+		if val == nil {
+			err = writer.AppendBool(false)
+		} else {
+			err = writer.AppendBool(true)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	writer.AlignBytes(8)
+
+	return nil
+}
+
+// ArrayValueReader is an aux class to reader item data from bytes buffer
+type ArrayValueReader struct {
+	itemType DataType
+	value    unsafe.Pointer
+	length   int
+}
+
+// NewArrayValueReader is to create ArrayValueReader to read from upsertbatch, which includes the item number
+func NewArrayValueReader(dataType DataType, value unsafe.Pointer) *ArrayValueReader {
+	length := *((*uint32)(value))
+	return &ArrayValueReader{
+		itemType: GetItemDataType(dataType),
+		value:    unsafe.Pointer(uintptr(value) + 4),
+		length:   int(length),
+	}
+}
+
+// GetLength return item numbers inside the array
+func (reader *ArrayValueReader) GetLength() int {
+	return reader.length
+}
+
+// GetBytes returns the bytes counts this value occopies
+func (reader *ArrayValueReader) GetBytes() int {
+	return CalculateListElementBytes(reader.itemType, reader.length)
+}
+
+// GetBool returns bool value for Bool item type at index
+func (reader *ArrayValueReader) GetBool(index int) bool {
+	if index < 0 || index >= reader.length {
+		return false
+	}
+	val := *(*byte)(unsafe.Pointer(uintptr(reader.value) + uintptr(index/8)))
+	return val&(0x1<<uint8(index%8)) != 0x0
+}
+
+// Get returns the buffer pointer for the index-th item
+func (reader *ArrayValueReader) Get(index int) unsafe.Pointer {
+	if index < 0 || index >= reader.length {
+		return nil
+	}
+	return unsafe.Pointer(uintptr(reader.value) + uintptr(index*DataTypeBytes(reader.itemType)))
+}
+
+// IsValid check if the item in index-th place is valid or not
+func (reader *ArrayValueReader) IsValid(index int) bool {
+	nilOffset := CalculateListNilOffset(reader.itemType, int(reader.length))
+	nilByte := *(*byte)(unsafe.Pointer(uintptr(reader.value) + uintptr(nilOffset) + uintptr(index/8)))
+	return nilByte&(0x1<<uint8(index%8)) != 0x0
+}
+
+// CalculateListElementBytes returns the total size in bytes needs to be allocated for a list type column for a single
+// row along with the validity vector start.
+func CalculateListElementBytes(dataType DataType, length int) int {
+	if length == 0 {
+		return 0
+	}
+	// there is a item number at beginning
+	// element_number_bits => 8 * 4 (4 bytes)
+	// DataTypeBits(dataType) * length => element_bits, round to byte
+	// 1 * length => null bits, round to byte
+	// (element_number_bits + element_bits + null_bits + 63) / 64 => round by 64 bits (8 bytes)
+	return (4*8 + (DataTypeBits(dataType)*length+7)/8*8 + (length+7)/8*8 + 63) / 64 * 8
+}
+
+func CalculateListNilOffset(dataType DataType, length int) int {
+	return (DataTypeBits(dataType)*length + 7) / 8
 }

@@ -18,7 +18,6 @@ import (
 	"github.com/uber/aresdb/cluster/shard"
 	"github.com/uber/aresdb/common"
 	"github.com/uber/aresdb/datanode/bootstrap"
-	"github.com/uber/aresdb/memstore"
 	"github.com/uber/aresdb/utils"
 	"time"
 )
@@ -33,23 +32,13 @@ type DataNode interface {
 	// ShardSet returns the set of shards currently associated with this datanode.
 	ShardSet() shard.ShardSet
 
-	// Tables
-	Tables() []string
-
-	// GetTableShard will get table shard
-	GetTableShard(table string, shardID uint32) (*memstore.TableShard, error)
-
 	// Open data node
 	Open() error
-
-	// Bootstrap starts data node bootstap
-	Bootstrap() error
 
 	// Close data node
 	Close()
 
-	// Serve will start serving read and write requests
-	// should always call Bootstrap() during server start before Serve()
+	// serve will start serving read and write requests
 	Serve()
 }
 

@@ -157,8 +157,8 @@ var _ = ginkgo.Describe("hll", func() {
 				DimensionVectorIndex: []int{0, 2, 1},
 			},
 			fixedTimezone: loc,
-			fromTime:      &alignedTime{Time: time.Now().In(loc), Unit: "week"},
-			toTime:        &alignedTime{Time: time.Now().In(loc), Unit: "week"},
+			fromTime:      &queryCom.AlignedTime{Time: time.Now().In(loc), Unit: "week"},
+			toTime:        &queryCom.AlignedTime{Time: time.Now().In(loc), Unit: "week"},
 		}
 
 		dataTypes := []memCom.DataType{memCom.Uint32, memCom.Uint8, memCom.Int16}
@@ -182,7 +182,7 @@ var _ = ginkgo.Describe("hll", func() {
 		Ω(data[104 : 104+queryCom.DenseDataLength+28]).Should(Equal(hllData[:]))
 
 		// Then we deserialize it.
-		res, err := queryCom.NewTimeSeriesHLLResult(data, queryCom.HLLDataHeader)
+		res, err := queryCom.NewTimeSeriesHLLResult(data, queryCom.HLLDataHeader, false)
 		Ω(err).Should(BeNil())
 		Ω(res).Should(Equal(queryCom.AQLQueryResult{
 			"NULL": map[string]interface{}{
@@ -208,7 +208,7 @@ var _ = ginkgo.Describe("hll", func() {
 		data, err := qc.SerializeHLL(dataTypes, enumReverseDict, nil)
 		Ω(err).Should(BeNil())
 		//ioutil.WriteFile("../testing/data/query/hll", data, 0644)
-		res, err := queryCom.NewTimeSeriesHLLResult(data, queryCom.HLLDataHeader)
+		res, err := queryCom.NewTimeSeriesHLLResult(data, queryCom.HLLDataHeader, false)
 		Ω(err).Should(BeNil())
 		Ω(res).Should(Equal(queryCom.AQLQueryResult{
 			"NULL": map[string]interface{}{
@@ -237,13 +237,13 @@ var _ = ginkgo.Describe("hll", func() {
 		//queryE.WriteResult([]byte{})
 		//err := ioutil.WriteFile("../testing/data/query/hll_empty_results", queryE.GetBytes(), 0644)
 
-		queryResults := NewHLLQueryResults()
+		queryResults := queryCom.NewHLLQueryResults()
 		data, err := qc.SerializeHLL(dataTypes, enumReverseDict, nil)
 		Ω(err).Should(BeNil())
 
 		queryResults.WriteResult(data)
 
-		results, errs, err := queryCom.ParseHLLQueryResults(queryResults.GetBytes())
+		results, errs, err := queryCom.ParseHLLQueryResults(queryResults.GetBytes(), false)
 		Ω(err).Should(BeNil())
 		Ω(errs).Should(HaveLen(1))
 		Ω(errs[0]).Should(BeNil())
@@ -270,7 +270,7 @@ var _ = ginkgo.Describe("hll", func() {
 		bs := queryResults.GetBytes()
 		//ioutil.WriteFile("../testing/data/query/hll_query_results", bs, 0644)
 
-		results, errs, err = queryCom.ParseHLLQueryResults(bs)
+		results, errs, err = queryCom.ParseHLLQueryResults(bs, false)
 		Ω(err).Should(BeNil())
 		Ω(errs).Should(HaveLen(2))
 		Ω(results).Should(HaveLen(2))

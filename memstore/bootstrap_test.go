@@ -44,10 +44,10 @@ import (
 var _ = ginkgo.Describe("table shard bootstrap", func() {
 	diskStore := &diskMocks.DiskStore{}
 	metaStore := &metaMocks.MetaStore{}
-	redoLogManagerMaster, _ := redolog.NewRedoLogManagerMaster(&common.RedoLogConfig{}, diskStore, metaStore)
+	redoLogManagerMaster, _ := redolog.NewRedoLogManagerMaster("", &common.RedoLogConfig{}, diskStore, metaStore)
 	bootstrapToken := new(memComMocks.BootStrapToken)
-	bootstrapToken.On("AcquireToken",  mock.Anything, mock.Anything).Return(true)
-	bootstrapToken.On("ReleaseToken",  mock.Anything, mock.Anything).Return()
+	bootstrapToken.On("AcquireToken", mock.Anything, mock.Anything).Return(true)
+	bootstrapToken.On("ReleaseToken", mock.Anything, mock.Anything).Return()
 	memStore := NewMemStore(metaStore, diskStore, NewOptions(bootstrapToken, redoLogManagerMaster)).(*memStoreImpl)
 	peerSource := &datanodeMocks.PeerSource{}
 
@@ -91,10 +91,11 @@ var _ = ginkgo.Describe("table shard bootstrap", func() {
 
 		mockPeerDataNodeClient := &rpcMocks.PeerDataNodeClient{}
 		mockSession := &rpc.Session{ID: 0}
+		mockPeerDataNodeClient.On("Health", mock.Anything).Return(mock.Anything, &rpc.HealthCheckResponse{Status: rpc.HealthCheckResponse_SERVING}, nil)
 		mockPeerDataNodeClient.On("StartSession", mock.Anything, mock.Anything).Return(mockSession, nil)
-		peerSource.On("BorrowConnection", host1.ID(), mock.Anything).Run(func(args mock.Arguments) {
+		peerSource.On("BorrowConnection", []string{host1.ID()}, mock.Anything).Run(func(args mock.Arguments) {
 			fn := args.Get(1).(client.WithConnectionFn)
-			fn(mockPeerDataNodeClient)
+			fn(host1.String(), mockPeerDataNodeClient)
 		}).Return(nil)
 
 		mockKeepAliveStream := &rpcMocks.PeerDataNode_KeepAliveClient{}
@@ -117,7 +118,8 @@ var _ = ginkgo.Describe("table shard bootstrap", func() {
 			})
 			defer utils.ResetClockImplementation()
 
-			sorted, _ := GetFactory().ReadArchiveBatch("archiving/archiveBatch0")
+			sorted, err1 := GetFactory().ReadArchiveBatch("archiving/archiveBatch0")
+			Ω(err1).Should(BeNil())
 
 			vp0BufferSorted := &bytes.Buffer{}
 			vp1BufferSorted := &bytes.Buffer{}
