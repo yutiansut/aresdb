@@ -35,3 +35,4 @@ RUN make npm-install
 RUN mkdir log
 
 RUN make aresd -j
+CMD ['make run_server >> ./log/aresdb.log 2>&1 &']
