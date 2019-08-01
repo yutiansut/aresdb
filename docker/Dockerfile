@@ -30,7 +30,7 @@ RUN git clone --recursive https://github.com/uber/aresdb.git \
 && ln -sf $UBER_GITHUB_DIR/aresdb $HOME/aresdb
 WORKDIR aresdb
 RUN cmake . \
-&& make npm-install
-&& mkdir log
+&& make npm-install \
+&& mkdir log \
 && make aresd -j
 CMD ['make run_server >> ./log/aresdb.log 2>&1 &']
