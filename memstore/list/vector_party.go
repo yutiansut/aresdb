@@ -16,6 +16,7 @@ package list
 
 import (
 	"github.com/uber/aresdb/memstore/common"
+	"github.com/uber/aresdb/memstore/vectors"
 	"unsafe"
 )
 
@@ -26,7 +27,7 @@ import (
 // 2. There is no default value concept for list at least for now, so we will not store default value.
 type baseVectorParty struct {
 	// offset is a pair of uint32 [offset, length]. therefore its length is 2 * length of vp.
-	offsets *common.Vector
+	offsets *vectors.Vector
 	// length of vp.
 	length int
 	// DataType of values. We need it since for mode 0 vector party, we cannot
@@ -130,7 +131,7 @@ func arrayValueCompare(dataType common.DataType, left, right unsafe.Pointer) boo
 		return false
 	}
 
-	itemType := common.GetItemDataType(dataType)
+	itemType := common.GetElementDataType(dataType)
 	cmpFunc := common.GetCompareFunc(itemType)
 	for i := 0; i < lReader.GetLength(); i++ {
 		if itemType == common.Bool {
