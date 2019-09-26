@@ -128,7 +128,9 @@ func NewDataNode(
 		return nil, utils.StackError(err, "failed to initialize redolog manager master")
 	}
 
-	memStore := memstore.NewMemStore(metaStore, diskStore, memstore.NewOptions(bootstrapToken, redoLogManagerMaster))
+	numShards := len(topo.Get().ShardSet().AllIDs())
+	memStore := memstore.NewMemStore(metaStore, diskStore,
+		memstore.NewOptions(bootstrapToken, redoLogManagerMaster, memstore.WithNumShards(numShards)))
 
 	grpcServer := grpc.NewServer()
 	rpc.RegisterPeerDataNodeServer(grpcServer, bootstrapServer)
@@ -137,7 +139,7 @@ func NewDataNode(
 	d := &dataNode{
 		hostID:               hostID,
 		topo:                 topo,
-		enumReader:			  enumReader,
+		enumReader:           enumReader,
 		metaStore:            metaStore,
 		memStore:             memStore,
 		diskStore:            diskStore,
