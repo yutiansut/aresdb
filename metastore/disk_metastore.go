@@ -159,6 +159,14 @@ func (dm *diskMetaStore) GetArchivingCutoff(tableName string, shard int) (uint32
 	return dm.readVersion(file)
 }
 
+// DeleteTableShard deletes all table shard level metadata
+func (dm *diskMetaStore) DeleteTableShard(tableName string, shard int) error {
+	dm.Lock()
+	defer dm.Unlock()
+	shardDirPath := dm.getShardDirPath(tableName, shard)
+	return dm.RemoveAll(shardDirPath)
+}
+
 // GetSnapshotProgress gets the latest snapshot progress for given table and shard
 func (dm *diskMetaStore) GetSnapshotProgress(tableName string, shard int) (int64, uint32, int32, uint32, error) {
 	dm.RLock()
@@ -479,7 +487,7 @@ func (dm *diskMetaStore) CreateTable(table *common.Table) (err error) {
 
 	// append enum case for enum column with default value
 	for _, column := range table.Columns {
-		if column.DefaultValue != nil && column.IsEnumColumn() {
+		if column.DefaultValue != nil && column.IsEnumBasedColumn() {
 			err = dm.writeEnumFile(table.Name, column.Name, []string{*column.DefaultValue})
 			if err != nil {
 				return err
@@ -546,7 +554,7 @@ func (dm *diskMetaStore) UpdateTable(table common.Table) (err error) {
 	// append enum case for enum column with default value for new columns
 	for i := len(existingTable.Columns); i < len(table.Columns); i++ {
 		column := table.Columns[i]
-		if column.DefaultValue != nil && column.IsEnumColumn() {
+		if column.DefaultValue != nil && column.IsEnumBasedColumn() {
 			err = dm.writeEnumFile(table.Name, column.Name, []string{*column.DefaultValue})
 			if err != nil {
 				return
@@ -675,7 +683,7 @@ func (dm *diskMetaStore) DeleteColumn(tableName string, columnName string) (err 
 }
 
 // ExtendEnumDict extends enum cases for given table column
-func (dm *diskMetaStore) ExtendEnumDict(table, column string, enumCases []string) (enumIDs []int, err error) {
+func (dm *diskMetaStore) ExtendEnumDict(table, columnName string, enumCases []string) (enumIDs []int, err error) {
 	dm.writeLock.Lock()
 	defer dm.writeLock.Unlock()
 
@@ -687,7 +695,7 @@ func (dm *diskMetaStore) ExtendEnumDict(table, column string, enumCases []string
 		dm.Unlock()
 		if err == nil {
 			if _, tableExist := dm.enumDictWatchers[table]; tableExist {
-				if watcher, columnExist := dm.enumDictWatchers[table][column]; columnExist {
+				if watcher, columnExist := dm.enumDictWatchers[table][columnName]; columnExist {
 					for _, enumCase := range newEnumCases {
 						watcher <- enumCase
 					}
@@ -696,11 +704,17 @@ func (dm *diskMetaStore) ExtendEnumDict(table, column string, enumCases []string
 		}
 	}()
 
-	if err = dm.enumColumnExists(table, column); err != nil {
-		return nil, err
+	var column *common.Column
+	column, err = dm.getColumnByName(table, columnName)
+	if err != nil {
+		return
+	}
+	if !column.IsEnumBasedColumn() {
+		err = common.ErrNotEnumColumn
+		return
 	}
 
-	existingCases, err = dm.readEnumFile(table, column)
+	existingCases, err = dm.readEnumFile(table, columnName)
 	if err != nil {
 		return nil, err
 	}
@@ -711,6 +725,12 @@ func (dm *diskMetaStore) ExtendEnumDict(table, column string, enumCases []string
 	}
 
 	newEnumID := len(existingCases)
+
+	enumCardinalityLimit := common.EnumCardinality(column.Type)
+	if newEnumID+len(enumCases) > enumCardinalityLimit {
+		err = common.ErrEnumCardinalityOverflow
+		return
+	}
 
 	enumIDs = make([]int, len(enumCases))
 	for index, newCase := range enumCases {
@@ -724,13 +744,13 @@ func (dm *diskMetaStore) ExtendEnumDict(table, column string, enumCases []string
 		}
 	}
 
-	if err = dm.writeEnumFile(table, column, newEnumCases); err != nil {
+	if err = dm.writeEnumFile(table, columnName, newEnumCases); err != nil {
 		return nil, err
 	}
 
 	utils.GetRootReporter().GetChildGauge(map[string]string{
 		"table":      table,
-		"columnName": column,
+		"columnName": columnName,
 	}, utils.NumberOfEnumCasesPerColumn).Update(float64(newEnumID))
 
 	return enumIDs, nil
@@ -1021,7 +1041,7 @@ func (dm *diskMetaStore) addColumn(table *common.Table, column common.Column, ap
 	}
 
 	// if enum column, append a enum case for default value
-	if column.DefaultValue != nil && column.IsEnumColumn() {
+	if column.DefaultValue != nil && column.IsEnumBasedColumn() {
 		return dm.writeEnumFile(table.Name, column.Name, []string{*column.DefaultValue})
 	}
 
@@ -1068,7 +1088,7 @@ func (dm *diskMetaStore) removeColumn(table *common.Table, columnName string) er
 				return err
 			}
 
-			if column.IsEnumColumn() {
+			if column.IsEnumBasedColumn() {
 				dm.removeEnumColumn(table.Name, column.Name)
 			}
 
@@ -1411,16 +1431,14 @@ func (dm *diskMetaStore) tableExists(tableName string) error {
 	return nil
 }
 
-// enumColumnExists checks whether column exists and it is a enum column,
-// return ErrTableDoesNotExist, ErrColumnDoesNotExist, ErrNotEnumColumn.
-func (dm *diskMetaStore) enumColumnExists(tableName string, columnName string) error {
+func (dm *diskMetaStore) getColumnByName(tableName, columnName string) (*common.Column, error) {
 	if err := dm.tableExists(tableName); err != nil {
-		return err
+		return nil, err
 	}
 
 	table, err := dm.readSchemaFile(tableName)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	for _, column := range table.Columns {
@@ -1431,14 +1449,27 @@ func (dm *diskMetaStore) enumColumnExists(tableName string, columnName string) e
 				continue
 			}
 
-			if !column.IsEnumColumn() {
-				return common.ErrNotEnumColumn
+			if !column.IsEnumBasedColumn() {
+				return nil, common.ErrNotEnumColumn
 			}
-
-			return nil
+			return &column, nil
 		}
 	}
-	return common.ErrColumnDoesNotExist
+	return nil, common.ErrColumnDoesNotExist
+}
+
+// enumColumnExists checks whether column exists and it is a enum column,
+// return ErrTableDoesNotExist, ErrColumnDoesNotExist, ErrNotEnumColumn.
+func (dm *diskMetaStore) enumColumnExists(tableName string, columnName string) error {
+	column, err := dm.getColumnByName(tableName, columnName)
+	if err != nil {
+		return err
+	}
+	if !column.IsEnumBasedColumn() {
+		return common.ErrNotEnumColumn
+	}
+
+	return nil
 }
 
 // NewDiskMetaStore creates a new disk based metastore

@@ -16,6 +16,7 @@ package api
 
 import (
 	"encoding/json"
+	"github.com/m3db/m3/src/x/sync"
 	"github.com/uber/aresdb/cluster/topology"
 	"net/http"
 
@@ -36,14 +37,23 @@ type QueryHandler struct {
 	shardOwner    topology.ShardOwner
 	memStore      memstore.MemStore
 	deviceManager *query.DeviceManager
+	workerPool    sync.WorkerPool
 }
 
 // NewQueryHandler creates a new QueryHandler.
-func NewQueryHandler(memStore memstore.MemStore, shardOwner topology.ShardOwner, cfg common.QueryConfig) *QueryHandler {
+func NewQueryHandler(
+	memStore memstore.MemStore,
+	shardOwner topology.ShardOwner,
+	cfg common.QueryConfig,
+	maxConcurrentQueries int,
+) *QueryHandler {
+	workerPool := sync.NewWorkerPool(maxConcurrentQueries)
+	workerPool.Init()
 	return &QueryHandler{
 		memStore:      memStore,
 		shardOwner:    shardOwner,
 		deviceManager: query.NewDeviceManager(cfg),
+		workerPool:    workerPool,
 	}
 }
 
@@ -85,7 +95,17 @@ func (handler *QueryHandler) HandleAQL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	handler.handleAQLInternal(aqlRequest, w, r)
+	done := make(chan struct{})
+	available := handler.workerPool.GoIfAvailable(func() {
+		defer close(done)
+		handler.handleAQLInternal(aqlRequest, w, r)
+	})
+
+	if !available {
+		apiCom.RespondWithError(w, apiCom.ErrQueryServiceNotAvailable)
+		return
+	}
+	<-done
 }
 
 func (handler *QueryHandler) handleAQLInternal(aqlRequest apiCom.AQLRequest, w http.ResponseWriter, r *http.Request) {
@@ -303,6 +323,7 @@ type QueryResponseWriter interface {
 	ReportError(queryIndex int, table string, err error, statusCode int)
 	ReportQueryContext(*query.AQLQueryContext)
 	ReportResult(int, *query.AQLQueryContext)
+	// param compress means whether client accepts compressed results
 	Respond(w http.ResponseWriter)
 	GetStatusCode() int
 }
@@ -399,7 +420,7 @@ func (w *HLLQueryResponseWriter) ReportResult(queryIndex int, qc *query.AQLQuery
 
 // Respond writes the final response into ResponseWriter.
 func (w *HLLQueryResponseWriter) Respond(rw http.ResponseWriter) {
-	rw.Header().Set("Content-Type", utils.HTTPContentTypeHyperLogLog)
+	rw.Header().Set(utils.HTTPContentTypeHeaderKey, utils.HTTPContentTypeHyperLogLog)
 	apiCom.RespondBytesWithCode(rw, w.statusCode, w.response.GetBytes())
 }
 

@@ -584,6 +584,15 @@ func blockNumericOpsForColumnOverFourBytes(token expr.Token, expressions ...expr
 	return nil
 }
 
+func blockInt64(expressions ...expr.Expr) error {
+	for _, expression := range expressions {
+		if varRef, isVarRef := expression.(*expr.VarRef); isVarRef && memCom.Int64 == varRef.DataType {
+			return utils.StackError(nil, "binary transformation not allowed for int64 fields, got %s", expression.String())
+		}
+	}
+	return nil
+}
+
 // Rewrite walks the expresison AST and resolves data types bottom up.
 // In addition it also translates enum strings and rewrites their predicates.
 func (qc *AQLQueryContext) Rewrite(expression expr.Expr) expr.Expr {
@@ -678,6 +687,12 @@ func (qc *AQLQueryContext) Rewrite(expression expr.Expr) expr.Expr {
 			return expression
 		}
 
+		// TODO: @shz support int64 binary transform
+		if err := blockInt64(e.LHS, e.RHS); err != nil {
+			qc.Error = err
+			return expression
+		}
+
 		if e.Op != expr.EQ && e.Op != expr.NEQ {
 			_, isRHSStr := e.RHS.(*expr.StringLiteral)
 			_, isLHSStr := e.LHS.(*expr.StringLiteral)
@@ -766,11 +781,19 @@ func (qc *AQLQueryContext) Rewrite(expression expr.Expr) expr.Expr {
 				e.RHS = expr.Cast(e.RHS, highestType)
 			}
 
-			if rhs != nil && lhs.DataType == memCom.GeoPoint {
+			if rhs != nil && e.LHS.Type() == expr.GeoPoint {
 				if val, err := memCom.GeoPointFromString(rhs.Val); err != nil {
 					qc.Error = err
 				} else {
 					e.RHS = &expr.GeopointLiteral{
+						Val: val,
+					}
+				}
+			} else if rhs != nil && e.LHS.Type() == expr.UUID {
+				if val, err := memCom.UUIDFromString(rhs.Val); err != nil {
+					qc.Error = err
+				} else {
+					e.RHS = &expr.UUIDLiteral{
 						Val: val,
 					}
 				}
@@ -1076,10 +1099,19 @@ func (qc *AQLQueryContext) Rewrite(expression expr.Expr) expr.Expr {
 						break
 					}
 				case memCom.SmallEnum, memCom.BigEnum:
+					if qc.DataOnly {
+						// if the request is from broker, it should be already a number literal
+						literalExpr, ok = secondArg.(*expr.NumberLiteral)
+						if !ok {
+							qc.Error = utils.StackError(
+								nil, "array function %s argument type mismatch, expecting number literal", e.Name)
+						}
+						break
+					}
 					strLiteral, ok := secondArg.(*expr.StringLiteral)
 					if !ok {
 						qc.Error = utils.StackError(
-							nil, "array function %s argument type mismatch", e.Name)
+							nil, "array function %s argument type mismatch, expecting string literal", e.Name)
 						break
 					}
 					if vr.EnumDict != nil {
@@ -1097,18 +1129,32 @@ func (qc *AQLQueryContext) Rewrite(expression expr.Expr) expr.Expr {
 					strLiteral, ok := secondArg.(*expr.StringLiteral)
 					if !ok {
 						qc.Error = utils.StackError(
-							nil, "array function %s argument type mismatch", e.Name)
+							nil, "array function %s argument type mismatch, expecting string literal", e.Name)
 						break
 					}
-					if val, err := memCom.GeoPointFromString(strLiteral.Val); err != nil {
+					val, err := memCom.GeoPointFromString(strLiteral.Val)
+					if err != nil {
 						qc.Error = err
 						break
-					} else {
-						literalExpr = &expr.GeopointLiteral{
-							Val: val,
-						}
 					}
-				case memCom.Uint8, memCom.Uint16, memCom.Uint32, memCom.Int8, memCom.Int16, memCom.Int32:
+					literalExpr = &expr.GeopointLiteral{
+						Val: val,
+					}
+				case memCom.UUID:
+					strLiteral, ok := secondArg.(*expr.StringLiteral)
+					if !ok {
+						qc.Error = utils.StackError(nil, "array function %s needs uuid string literal", e.Name)
+						break
+					}
+					val, err := memCom.UUIDFromString(strLiteral.Val)
+					if err != nil {
+						qc.Error = err
+						break
+					}
+					literalExpr = &expr.UUIDLiteral{
+						Val: val,
+					}
+				case memCom.Uint8, memCom.Uint16, memCom.Uint32, memCom.Int8, memCom.Int16, memCom.Int32, memCom.Float32:
 					ok := false
 					literalExpr, ok = secondArg.(*expr.NumberLiteral)
 					if !ok {
@@ -1749,6 +1795,20 @@ func (g *geoTableUsageCollector) Visit(expression expr.Expr) expr.Visitor {
 	return g
 }
 
+// arrayColumnUsageCollector traverses an AST expression tree, finds VarRef columns
+// and check whether it uses any array column
+type arrayColumnUsageCollector struct {
+	useArrayColumn bool
+}
+
+func (ac *arrayColumnUsageCollector) Visit(expression expr.Expr) expr.Visitor {
+	switch e := expression.(type) {
+	case *expr.VarRef:
+		ac.useArrayColumn = ac.useArrayColumn || memCom.IsArrayType(e.DataType)
+	}
+	return ac
+}
+
 func (qc *AQLQueryContext) processMeasure() {
 	// OOPK engine only supports one measure per query.
 	if len(qc.Query.Measures) != 1 {
@@ -1788,6 +1848,16 @@ func (qc *AQLQueryContext) processMeasure() {
 		return
 	}
 	qc.OOPK.Measure = aggregate.Args[0]
+
+	// check if any array column is used in measure
+	ac := &arrayColumnUsageCollector{}
+	expr.Walk(ac, qc.OOPK.Measure)
+	if ac.useArrayColumn {
+		qc.Error = utils.StackError(nil,
+			"Array column is not allowed to be used in measure: %s", qc.OOPK.Measure.String())
+		return
+	}
+
 	// default is 4 bytes
 	qc.OOPK.MeasureBytes = 4
 	switch strings.ToLower(aggregate.Name) {
@@ -1855,7 +1925,9 @@ func (qc *AQLQueryContext) processMeasure() {
 func (qc *AQLQueryContext) getAllColumnsDimension() (columns []common.Dimension) {
 	// only main table columns wildcard match supported
 	for _, column := range qc.TableScanners[0].Schema.Schema.Columns {
-		if !column.Deleted && column.Type != metaCom.GeoShape {
+		dataType := memCom.DataTypeFromString(column.Type)
+		// no geoshape and array type directly supported as dimension
+		if !column.Deleted && column.Type != metaCom.GeoShape && !memCom.IsArrayType(dataType) {
 			columns = append(columns, common.Dimension{
 				ExprParsed: &expr.VarRef{Val: column.Name},
 				Expr:       column.Name,
@@ -1874,6 +1946,13 @@ func (qc *AQLQueryContext) processDimensions() {
 		if dim.ExprParsed.Type() == expr.GeoShape {
 			qc.Error = utils.StackError(nil,
 				"GeoShape can not be used for dimension: %s", dim.Expr)
+			return
+		}
+
+		// array column can not be used as dimension directly
+		if dimExpr, ok := dim.ExprParsed.(*expr.VarRef); ok && memCom.IsArrayType(dimExpr.DataType) {
+			qc.Error = utils.StackError(nil,
+				"Array column can not be used for dimension directly: %s", dim.Expr)
 			return
 		}
 	}

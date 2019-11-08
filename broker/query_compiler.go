@@ -61,6 +61,54 @@ func NewQueryContext(aql *common.AQLQuery, returnHLLBinary bool, w http.Response
 	return &ctx
 }
 
+// GetRewrittenQuery get the rewritten query after query parsing
+func (qc *QueryContext) GetRewrittenQuery() common.AQLQuery {
+	newQuery := *qc.AQLQuery
+	for i, measure := range newQuery.Measures {
+		if measure.ExprParsed != nil {
+			measure.Expr = measure.ExprParsed.String()
+			newQuery.Measures[i] = measure
+		}
+	}
+
+	for i, join := range newQuery.Joins {
+		for j := range join.Conditions {
+			if j < len(join.ConditionsParsed) && join.ConditionsParsed[j] != nil {
+				join.Conditions[j] = join.ConditionsParsed[j].String()
+			}
+		}
+		newQuery.Joins[i] = join
+	}
+
+	for i, dim := range newQuery.Dimensions {
+		if dim.ExprParsed != nil {
+			dim.Expr = dim.ExprParsed.String()
+			newQuery.Dimensions[i] = dim
+		}
+	}
+
+	for i := range newQuery.Filters {
+		if i < len(newQuery.FiltersParsed) && newQuery.FiltersParsed[i] != nil {
+			newQuery.Filters[i] = newQuery.FiltersParsed[i].String()
+		}
+	}
+
+	for i, measure := range newQuery.SupportingMeasures {
+		if measure.ExprParsed != nil {
+			measure.Expr = measure.ExprParsed.String()
+			newQuery.SupportingMeasures[i] = measure
+		}
+	}
+
+	for i, dim := range newQuery.SupportingDimensions {
+		if dim.ExprParsed != nil {
+			dim.Expr = dim.ExprParsed.String()
+			newQuery.SupportingDimensions[i] = dim
+		}
+	}
+	return newQuery
+}
+
 // Compile parses expressions into ast, load schema from schema reader, resolve types,
 // and collects meta data needed by post processing
 func (qc *QueryContext) Compile(tableSchemaReader memCom.TableSchemaReader) {
@@ -306,6 +354,7 @@ func (qc *QueryContext) processDimensions() {
 				qc.DimensionEnumReverseDicts[idx] = vr.EnumReverseDict
 			}
 		}
+		qc.AQLQuery.Dimensions[idx] = dim
 	}
 }
 
@@ -436,6 +485,11 @@ func (qc *QueryContext) Rewrite(expression expr.Expr) expr.Expr {
 		}
 	case *expr.BinaryExpr:
 		if err := blockNumericOpsForColumnOverFourBytes(e.Op, e.LHS, e.RHS); err != nil {
+			qc.Error = err
+			return expression
+		}
+		// TODO: @shz support int64 binary transform
+		if err := blockInt64(e.LHS, e.RHS); err != nil {
 			qc.Error = err
 			return expression
 		}
@@ -865,6 +919,15 @@ func blockNumericOpsForColumnOverFourBytes(token expr.Token, expressions ...expr
 			if varRef, isVarRef := expression.(*expr.VarRef); isVarRef && memCom.DataTypeBytes(varRef.DataType) > 4 {
 				return utils.StackError(nil, "numeric operations not supported for column over 4 bytes length, got %s", expression.String())
 			}
+		}
+	}
+	return nil
+}
+
+func blockInt64(expressions ...expr.Expr) error {
+	for _, expression := range expressions {
+		if varRef, isVarRef := expression.(*expr.VarRef); isVarRef && memCom.Int64 == varRef.DataType {
+			return utils.StackError(nil, "binary transformation not allowed for int64 fields, got %s", expression.String())
 		}
 	}
 	return nil

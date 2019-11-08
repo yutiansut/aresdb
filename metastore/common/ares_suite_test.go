@@ -12,21 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package utils
+package common
 
 import (
-	"io"
+	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/gomega"
+
+	"testing"
+
+	"github.com/onsi/ginkgo/reporters"
 )
 
-// ReaderSeekerCloser represents the interface that we can read, seek and close an io stream.
-// We have define our own since there is no go built-in interface fot this.
-type ReaderSeekerCloser interface {
-	io.Reader
-	io.Seeker
-	io.Closer
-}
-
-type WriteSyncCloser interface {
-	io.WriteCloser
-	Sync() error
+func TestMetaStore(t *testing.T) {
+	RegisterFailHandler(Fail)
+	junitReporter := reporters.NewJUnitReporter("junit.xml")
+	RunSpecsWithDefaultAndCustomReporters(t, "Ares MetaStore common Suite", []Reporter{junitReporter})
 }

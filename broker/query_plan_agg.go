@@ -26,6 +26,7 @@ import (
 	queryCom "github.com/uber/aresdb/query/common"
 	"github.com/uber/aresdb/query/expr"
 	"github.com/uber/aresdb/utils"
+	"math/rand"
 	"net/http"
 	"strconv"
 	"strings"
@@ -218,9 +219,16 @@ func NewAggQueryPlan(qc *QueryContext, topo topology.HealthTrackingDynamicTopolo
 	var root common.MergeNode
 
 	var assignments map[topology.Host][]uint32
-	assignments, err = util.CalculateShardAssignment(topo)
-	if err != nil {
-		return
+	if qc.Tables[0].Schema.IsFactTable {
+		assignments, err = util.CalculateShardAssignment(topo)
+		if err != nil {
+			return
+		}
+	} else {
+		hosts := topo.Get().Hosts()
+		assignments = map[topology.Host][]uint32{
+			hosts[rand.Intn(len(hosts))]: {0},
+		}
 	}
 
 	// compiler already checked that only 1 measure exists, which is a expr.Call
@@ -320,6 +328,23 @@ func traverseRecursive(dimIndex int, curr interface{}, dimReverseDict map[int][]
 	return curr, nil
 }
 
+func getResultSizeRecursive(res interface{}) int {
+	total := 0
+	switch val := res.(type) {
+	case map[string]interface{}:
+		for _, v := range val {
+			total += getResultSizeRecursive(v)
+		}
+	case queryCom.AQLQueryResult:
+		for _, v := range val {
+			total += getResultSizeRecursive(v)
+		}
+	default:
+		return 1
+	}
+	return total
+}
+
 // convert HLL to binary format
 func (ap *AggQueryPlan) postProcessHLLBinary(res queryCom.AQLQueryResult, execErr error) (data []byte, err error) {
 	hllQueryResults := queryCom.NewHLLQueryResults()
@@ -329,12 +354,18 @@ func (ap *AggQueryPlan) postProcessHLLBinary(res queryCom.AQLQueryResult, execEr
 		return
 	}
 
+	resultSize := getResultSizeRecursive(res)
+	if resultSize == 0 {
+		hllQueryResults.WriteResult([]byte{})
+		data = hllQueryResults.GetBytes()
+		return
+	}
+
 	var (
 		qc           = ap.qc
 		dimDataTypes = make([]memCom.DataType, len(qc.AQLQuery.Dimensions))
 		reverseDicts = make(map[int][]string)
 		enumDicts    = make(map[int]map[string]int)
-		resultSize   = len(res)
 		hllVector    []byte
 		dimVector    []byte
 		countVector  []byte
@@ -343,18 +374,9 @@ func (ap *AggQueryPlan) postProcessHLLBinary(res queryCom.AQLQueryResult, execEr
 	// build dataTypes and enumDicts
 	for dimIdx, dim := range qc.AQLQuery.Dimensions {
 		dimDataTypes[dimIdx] = queryCom.GetDimensionDataType(dim.ExprParsed)
-		if memCom.IsEnumType(dimDataTypes[dimIdx]) {
-			var (
-				tableID  int
-				columnID int
-			)
-			tableID, columnID, err = qc.resolveColumn(dim.Expr)
-			if err != nil {
-				return
-			}
-			table := qc.Tables[tableID]
-			reverseDicts[dimIdx] = table.EnumDicts[table.Schema.Columns[columnID].Name].ReverseDict
-			enumDicts[dimIdx] = table.EnumDicts[table.Schema.Columns[columnID].Name].Dict
+		if varRef, ok := dim.ExprParsed.(*expr.VarRef); ok && memCom.IsEnumType(varRef.DataType) {
+			reverseDicts[dimIdx] = varRef.EnumReverseDict
+			enumDicts[dimIdx] = varRef.EnumDict
 		}
 	}
 
@@ -449,9 +471,10 @@ func splitAvgQuery(qc QueryContext) (sumqc QueryContext, countqc QueryContext) {
 
 func buildSubPlan(agg common.AggType, qc QueryContext, assignments map[topology.Host][]uint32, topo topology.HealthTrackingDynamicTopoloy, client dataCli.DataNodeQueryClient) common.MergeNode {
 	root := NewMergeNode(agg)
+	query := qc.GetRewrittenQuery()
 	for host, shardIDs := range assignments {
 		// make deep copy
-		currQ := *qc.AQLQuery
+		currQ := query
 		for _, shard := range shardIDs {
 			currQ.Shards = append(currQ.Shards, int(shard))
 		}

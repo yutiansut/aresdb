@@ -15,10 +15,16 @@
 package common
 
 import (
+	"compress/gzip"
 	"encoding/json"
 	"net/http"
 
 	"github.com/uber/aresdb/utils"
+)
+
+const (
+	// CompressionThreshold is the min number of bytes beyond which we will compress json payload
+	CompressionThreshold = 1 << 10
 )
 
 // ErrorResponse represents error response.
@@ -74,13 +80,29 @@ func RespondBytesWithCode(w http.ResponseWriter, code int, bs []byte) {
 // writeJSONBytes write jsonBytes to response if err is nil otherwise respond
 // with a ErrFailedToJSONMarshalResponseBody.
 func writeJSONBytes(w http.ResponseWriter, jsonBytes []byte, err error, code int) {
+	var gw *gzip.Writer
 	if err != nil {
 		RespondWithError(w, ErrFailedToJSONMarshalResponseBody)
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set(utils.HTTPContentTypeHeaderKey, utils.HTTPContentTypeApplicationJson)
+	willCompress := len(jsonBytes) > CompressionThreshold
+	if willCompress {
+		w.Header().Set(utils.HTTPContentEncodingHeaderKey, utils.HTTPContentEncodingGzip)
+	}
 	w.WriteHeader(code)
 	if jsonBytes != nil {
-		w.Write(jsonBytes)
+		if willCompress {
+			gw, err = gzip.NewWriterLevel(w, gzip.BestSpeed)
+			if err != nil {
+				RespondWithError(w, ErrFailedToJSONMarshalResponseBody)
+				return
+			}
+			defer gw.Close()
+			gw.Write(jsonBytes)
+		} else {
+			w.Write(jsonBytes)
+		}
+
 	}
 }
 

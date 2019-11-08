@@ -373,7 +373,7 @@ func (shard *TableShard) createVectorPartyRawDataRequest(
 	tableMeta *rpc.TableShardMetaData,
 	batchMeta *rpc.BatchMetaData,
 	vpMeta *rpc.VectorPartyMetaData,
-) (rawVPDataRequest *rpc.VectorPartyRawDataRequest, vpWriter io.WriteCloser, err error) {
+) (rawVPDataRequest *rpc.VectorPartyRawDataRequest, vpWriter utils.WriteSyncCloser, err error) {
 	if shard.Schema.Schema.IsFactTable {
 		// fact table archive vp writer
 		vpWriter, err = shard.diskStore.OpenVectorPartyFileForWrite(tableMeta.GetTable(),
@@ -425,7 +425,7 @@ func (shard *TableShard) createVectorPartyRawDataRequest(
 
 func (shard *TableShard) fetchVectorPartyRawDataFromPeer(
 	client rpc.PeerDataNodeClient,
-	vpWriter io.WriteCloser,
+	vpWriter utils.WriteSyncCloser,
 	request *rpc.VectorPartyRawDataRequest,
 ) (int, error) {
 	stream, err := client.FetchVectorPartyRawData(context.Background(), request)
@@ -447,6 +447,10 @@ func (shard *TableShard) fetchVectorPartyRawDataFromPeer(
 			return totalBytes, err
 		}
 		totalBytes += bytesWritten
+	}
+
+	if err = vpWriter.Sync(); err != nil {
+		return totalBytes, utils.StackError(err, "failed to sync to disk")
 	}
 	return totalBytes, nil
 }
@@ -522,6 +526,13 @@ func (shard *TableShard) startStreamSession(peerID string, client rpc.PeerDataNo
 	stream, err := client.KeepAlive(context.Background())
 	if err != nil {
 		return 0, nil, utils.StackError(err, "failed to create keep alive stream")
+	}
+
+	// send first keep alive request
+	if err = xretry.NewRetrier(xretry.NewOptions()).Attempt(func() error {
+		return stream.Send(&rpc.Session{ID: sessionID, NodeID: origin})
+	}); err != nil {
+		return 0, nil, utils.StackError(err, "failed to send keep alive session")
 	}
 
 	// send loop

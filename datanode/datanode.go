@@ -217,6 +217,8 @@ func (d *dataNode) Open() error {
 	go d.startAnalyzingShardAvailability()
 	// 9. start analyzing server readiness
 	go d.startAnalyzingServerReadiness()
+	// 10. start bootstrap retry watch
+	go d.startBootstrapRetryWatch()
 
 	return nil
 }
@@ -556,13 +558,13 @@ func (d *dataNode) addTable(table string) {
 	if !isFactTable {
 		d.logger.With("table", table, "shard", 0).Info("adding table shard on schema addition")
 		// dimension table defaults shard to zero
-		// new table does not need to copy data from peer
-		d.memStore.AddTableShard(table, 0, false)
+		// new table does not need to copy data from peer, but need to purge old data
+		d.memStore.AddTableShard(table, 0, false, true)
 	} else {
 		for _, shardID := range d.shardSet.AllIDs() {
 			d.logger.With("table", table, "shard", shardID).Info("adding table shard on schema addition")
-			// new table does not need to copy data from peer
-			d.memStore.AddTableShard(table, int(shardID), false)
+			// new table does not need to copy data from peer, but need to purge old data
+			d.memStore.AddTableShard(table, int(shardID), false, true)
 		}
 	}
 
@@ -630,7 +632,12 @@ func (d *dataNode) assignShardSet(shardSet shard.ShardSet) {
 		for _, table := range factTables {
 			d.logger.With("table", table, "shard", shardID).Info("removing fact table shard on placement change")
 			d.memStore.RemoveTableShard(table, int(shardID))
-			d.diskStore.DeleteTableShard(table, int(shardID))
+			if err := d.metaStore.DeleteTableShard(table, int(shardID)); err != nil {
+				d.logger.With("table", table, "shard", shardID).Error("failed to remove table shard metadata")
+			}
+			if err := d.diskStore.DeleteTableShard(table, int(shardID)); err != nil {
+				d.logger.With("table", table, "shard", shardID).Error("failed to remove table shard data")
+			}
 		}
 	}
 
@@ -638,7 +645,8 @@ func (d *dataNode) assignShardSet(shardSet shard.ShardSet) {
 		needPeerCopy := shard.State() == m3Shard.Initializing
 		for _, table := range factTables {
 			d.logger.With("table", table, "shard", shard.ID(), "state", shard.State()).Info("adding fact table shard on placement change")
-			d.memStore.AddTableShard(table, int(shard.ID()), needPeerCopy)
+			// when needPeerCopy is true, we also need to purge old data before adding new shard
+			d.memStore.AddTableShard(table, int(shard.ID()), needPeerCopy, needPeerCopy)
 		}
 	}
 
@@ -654,7 +662,8 @@ func (d *dataNode) assignShardSet(shardSet shard.ShardSet) {
 			d.logger.With("table", table, "shard", 0).Info("adding dimension table shard on placement change")
 			// only copy data from peer for dimension table
 			// when from zero shards to all initialing shards
-			d.memStore.AddTableShard(table, 0, needPeerCopy)
+			// when needPeerCopy is true, we also need to purge old data before adding new shard
+			d.memStore.AddTableShard(table, 0, needPeerCopy, needPeerCopy)
 		}
 	}
 
@@ -662,7 +671,12 @@ func (d *dataNode) assignShardSet(shardSet shard.ShardSet) {
 		for _, table := range dimensionTables {
 			d.logger.With("table", table, "shard", 0).Info("removing dimension table shard on placement change")
 			d.memStore.RemoveTableShard(table, 0)
-			d.diskStore.DeleteTableShard(table, 0)
+			if err := d.metaStore.DeleteTableShard(table, 0); err != nil {
+				d.logger.With("table", table, "shard", 0).Error("failed to remove table shard metadata")
+			}
+			if err := d.diskStore.DeleteTableShard(table, 0); err != nil {
+				d.logger.With("table", table, "shard", 0).Error("failed to remove table shard data")
+			}
 		}
 	}
 	d.shardSet = shardSet
@@ -697,8 +711,8 @@ func (d *dataNode) newHandlers() datanodeHandlers {
 	return datanodeHandlers{
 		schemaHandler:      api.NewSchemaHandler(d.metaStore),
 		enumHandler:        api.NewEnumHandler(d.memStore, d.metaStore),
-		queryHandler:       api.NewQueryHandler(d.memStore, d, d.opts.ServerConfig().Query),
-		dataHandler:        api.NewDataHandler(d.memStore),
+		queryHandler:       api.NewQueryHandler(d.memStore, d, d.opts.ServerConfig().Query, d.opts.ServerConfig().HTTP.MaxQueryConnections),
+		dataHandler:        api.NewDataHandler(d.memStore, d.opts.ServerConfig().HTTP.MaxIngestionConnections),
 		nodeModuleHandler:  http.StripPrefix("/node_modules/", http.FileServer(http.Dir("./api/ui/node_modules/"))),
 		debugStaticHandler: http.StripPrefix("/static/", utils.NoCache(http.FileServer(http.Dir("./api/ui/debug/")))),
 		swaggerHandler:     http.StripPrefix("/swagger/", http.FileServer(http.Dir("./api/ui/swagger/"))),
@@ -716,4 +730,18 @@ func mixedHandler(grpcServer *grpc.Server, httpHandler http.Handler) http.Handle
 			httpHandler.ServeHTTP(w, r)
 		}
 	})
+}
+
+func (d *dataNode) startBootstrapRetryWatch() {
+	for {
+		select {
+		case <-d.handlers.debugHandler.GetBootstrapRetryChan():
+			go func() {
+				err := d.bootstrapManager.Bootstrap()
+				if err != nil {
+					d.opts.InstrumentOptions().Logger().With("error", err.Error()).Error("error while retry bootstrapping")
+				}
+			}()
+		}
+	}
 }

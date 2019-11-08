@@ -89,6 +89,8 @@ var _ = ginkgo.Describe("table shard bootstrap", func() {
 		metaStore.On("UpdateRedoLogCommitOffset", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 		metaStore.On("UpdateRedoLogCheckpointOffset", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 		metaStore.On("OverwriteArchiveBatchVersion", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+		metaStore.On("DeleteTableShard", mock.Anything, mock.Anything).Return(nil)
+		diskStore.On("DeleteTableShard", mock.Anything, mock.Anything).Return(nil)
 
 		mockPeerDataNodeClient := &rpcMocks.PeerDataNodeClient{}
 		mockSession := &rpc.Session{ID: 0}
@@ -168,7 +170,7 @@ var _ = ginkgo.Describe("table shard bootstrap", func() {
 			}
 			memStore.TableSchemas[table] = tableSchema
 
-			memStore.AddTableShard(table, shardID, true)
+			memStore.AddTableShard(table, shardID, true, true)
 			defer memStore.RemoveTableShard(table, shardID)
 			shard, err := memStore.GetTableShard(table, shardID)
 			Ω(err).Should(BeNil())
@@ -177,9 +179,9 @@ var _ = ginkgo.Describe("table shard bootstrap", func() {
 			ctrl := gomock.NewController(utils.TestingT)
 			defer ctrl.Finish()
 
-			column0MockBuffer := &testingUtils.TestReadWriteCloser{}
-			column1MockBuffer := &testingUtils.TestReadWriteCloser{}
-			column2MockBuffer := &testingUtils.TestReadWriteCloser{}
+			column0MockBuffer := &testingUtils.TestReadWriteSyncCloser{}
+			column1MockBuffer := &testingUtils.TestReadWriteSyncCloser{}
+			column2MockBuffer := &testingUtils.TestReadWriteSyncCloser{}
 
 			diskStore.On("OpenVectorPartyFileForWrite", table, 0, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(column0MockBuffer, nil).Once()
 			diskStore.On("OpenVectorPartyFileForWrite", table, 1, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(column1MockBuffer, nil).Once()
@@ -295,9 +297,9 @@ var _ = ginkgo.Describe("table shard bootstrap", func() {
 			diskStore.On("ListSnapshotVectorPartyFiles", table, shardID, int64(redoFileID), uint32(redoFileOffset), lastReadBatchID).Return([]int{0, 1, 2}, nil).Once()
 			diskStore.On("ListLogFiles", table, shardID).Return([]int64{}, nil).Once()
 
-			column0MockBuffer := &testingUtils.TestReadWriteCloser{}
-			column1MockBuffer := &testingUtils.TestReadWriteCloser{}
-			column2MockBuffer := &testingUtils.TestReadWriteCloser{}
+			column0MockBuffer := &testingUtils.TestReadWriteSyncCloser{}
+			column1MockBuffer := &testingUtils.TestReadWriteSyncCloser{}
+			column2MockBuffer := &testingUtils.TestReadWriteSyncCloser{}
 
 			diskStore.On("OpenSnapshotVectorPartyFileForWrite", table, shardID, mock.Anything, mock.Anything, mock.Anything, 0).Return(column0MockBuffer, nil).Once()
 			diskStore.On("OpenSnapshotVectorPartyFileForWrite", table, shardID, mock.Anything, mock.Anything, mock.Anything, 1).Return(column1MockBuffer, nil).Once()
@@ -330,7 +332,7 @@ var _ = ginkgo.Describe("table shard bootstrap", func() {
 			}
 			memStore.TableSchemas[table] = tableSchema
 
-			memStore.AddTableShard(table, shardID, true)
+			memStore.AddTableShard(table, shardID, true, true)
 			defer memStore.RemoveTableShard(table, shardID)
 
 			shard, err := memStore.GetTableShard(table, shardID)
